@@ -5,6 +5,7 @@ import subprocess
 import threading
 from pathlib import Path
 
+from rich.style import Style as RichStyle
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 from textual import work
@@ -25,6 +26,17 @@ from easytrans.transcribe import transcribe_memo
 CIRCLE_OPEN = "\u25cb"    # ○
 CIRCLE_FILLED = "\u25cf"  # ●
 
+# Column render widths (content_width + 2 * cell_padding where padding=1)
+# Status: content=1, render=3
+# ID: content=9, render=11
+# Length: content=6, render=8
+# Model: content=6, render=8
+_FIXED_RENDER_W = 3 + 11 + 8 + 8   # = 30
+# Recorded: content=16, render=18
+# Transcribed: content=16, render=18
+_DATES_RENDER_W = 18 + 18           # = 36
+_CELL_PAD_RENDER = 2                # 2 * cell_padding for preview column
+
 
 class MemoPreview(Static):
     """Preview pane showing the selected memo's transcription text."""
@@ -37,6 +49,33 @@ class MemoPreview(Static):
         border-top: solid $accent;
     }
     """
+
+
+class MemoTable(DataTable):
+    """DataTable subclass with per-row red background for completed items."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.completed_rows: set[str] = set()
+
+    def on_resize(self, event) -> None:
+        """Rebuild table layout when the table widget itself is resized."""
+        app = self.app
+        if hasattr(app, "_refresh_table"):
+            app._refresh_table()
+
+    def _render_cell(self, row_index, column_index, base_style, width,
+                     cursor=False, hover=False):
+        if row_index >= 0:
+            try:
+                row_key = self._row_locations.get_key(row_index)
+                if row_key.value in self.completed_rows:
+                    base_style += RichStyle(bgcolor="dark_red")
+            except (KeyError, IndexError):
+                pass
+        return super()._render_cell(
+            row_index, column_index, base_style, width, cursor, hover,
+        )
 
 
 class EasyTransApp(App):
@@ -78,6 +117,8 @@ class EasyTransApp(App):
         self._retranscribe_worker = None
         # Memos marked done this session — shown with red bg until restart
         self._session_completed: set[str] = set()
+        # Whether date columns are currently visible
+        self._show_date_columns: bool = True
         # Child processes running Whisper; killed on quit
         self._active_processes: set = set()
         # Event signalling that the app is shutting down; checked by workers
@@ -86,17 +127,14 @@ class EasyTransApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical():
-            yield DataTable(id="memo-table")
+            yield MemoTable(id="memo-table")
             yield MemoPreview(id="preview")
         yield Footer()
 
     def on_mount(self) -> None:
-        table = self.query_one("#memo-table", DataTable)
+        table = self.query_one("#memo-table", MemoTable)
         table.cursor_type = "row"
-        table.add_columns(
-            "",  # status circle — no title
-            "ID", "Recorded", "Transcribed", "Length", "Model", "Preview",
-        )
+        table.completed_rows = self._session_completed
         self._refresh_table()
 
     def _get_selected_row_key(self) -> str | None:
@@ -125,7 +163,34 @@ class EasyTransApp(App):
         """Reload memo list from database, preserving cursor position."""
         table = self.query_one("#memo-table", DataTable)
         saved_key = self._get_selected_row_key()
-        table.clear()
+
+        # Calculate available width for columns
+        # Use the table's own width (more reliable during resize)
+        available = table.size.width or self.size.width
+        if available <= 0:
+            available = 120
+        available -= 2  # vertical scrollbar gutter
+
+        # Decide whether to show date columns based on Preview space
+        preview_w_with_dates = available - _FIXED_RENDER_W - _DATES_RENDER_W - _CELL_PAD_RENDER
+        self._show_date_columns = preview_w_with_dates >= 20
+
+        if self._show_date_columns:
+            preview_content_w = preview_w_with_dates
+        else:
+            preview_content_w = available - _FIXED_RENDER_W - _CELL_PAD_RENDER
+        preview_content_w = max(preview_content_w, 10)
+
+        # Rebuild columns
+        table.clear(columns=True)
+        table.add_column("", width=1)
+        table.add_column("ID", width=9)
+        table.add_column("Length", width=6)
+        table.add_column("Model", width=6)
+        table.add_column("Preview", width=preview_content_w)
+        if self._show_date_columns:
+            table.add_column("Recorded", width=16)
+            table.add_column("Transcribed", width=16)
 
         with Session(self.engine) as session:
             # Include completed memos if toggled, plus any completed this session
@@ -161,37 +226,21 @@ class EasyTransApp(App):
                 )
                 # Read first line from .md file for preview
                 md = text_path(self.config.data_dir, memo.file_id)
-                first_line = ""
+                preview = ""
                 if md.exists():
                     text = md.read_text().strip()
-                    first_line = text.split("\n")[0][:80] if text else ""
-                table.add_row(
-                    status, memo.file_id, recorded, transcribed,
-                    length, model, first_line,
-                    key=memo.file_hash,
-                )
+                    first_line = text.split("\n")[0] if text else ""
+                    # Show at least 60 chars (wrapping if needed), but
+                    # if the column is wider than 60, fill without wrapping.
+                    max_chars = max(60, preview_content_w)
+                    preview = first_line[:max_chars]
+                cells = [status, memo.file_id, length, model, preview]
+                if self._show_date_columns:
+                    cells.extend([recorded, transcribed])
+                table.add_row(*cells, key=memo.file_hash, height=None)
 
         self._move_cursor_to_key(saved_key)
-        self._style_session_completed()
         self._update_preview()
-
-    def _style_session_completed(self) -> None:
-        """Apply red background to all cells of rows completed this session."""
-        from rich.text import Text
-
-        table = self.query_one("#memo-table", DataTable)
-        num_cols = len(table.columns)
-        for row_idx in range(table.row_count):
-            rk, _ = table.coordinate_to_cell_key(Coordinate(row_idx, 0))
-            if rk.value in self._session_completed:
-                for col_idx in range(num_cols):
-                    coord = Coordinate(row_idx, col_idx)
-                    _, ck = table.coordinate_to_cell_key(coord)
-                    current = table.get_cell(rk, ck)
-                    table.update_cell(
-                        rk, ck,
-                        Text(str(current), style="on dark_red"),
-                    )
 
     def _get_selected_memo(self) -> Memo | None:
         """Get the currently selected memo from the table."""
@@ -212,20 +261,35 @@ class EasyTransApp(App):
             preview.update("No memo selected")
             return
 
+        parts = []
+
+        # Show dates in preview when date columns are hidden
+        if not self._show_date_columns:
+            recorded = memo.recorded_at.strftime("%Y-%m-%d %H:%M")
+            parts.append(f"Recorded: {recorded}")
+            with Session(self.engine) as session:
+                t = get_latest_transcription(session, memo.file_hash)
+                if t:
+                    transcribed = t.transcribed_at.strftime("%Y-%m-%d %H:%M")
+                    parts.append(f"Transcribed: {transcribed}")
+            parts.append("")
+
         if self.show_timestamps:
             with Session(self.engine) as session:
                 t = get_latest_transcription(session, memo.file_hash)
                 if t:
-                    preview.update(t.text)
+                    parts.append(t.text)
                 else:
-                    preview.update("(not yet transcribed)")
+                    parts.append("(not yet transcribed)")
         else:
             md = text_path(self.config.data_dir, memo.file_id)
             if md.exists():
                 text = md.read_text()
-                preview.update(text if text.strip() else "(empty transcription)")
+                parts.append(text if text.strip() else "(empty transcription)")
             else:
-                preview.update("(not yet transcribed)")
+                parts.append("(not yet transcribed)")
+
+        preview.update("\n".join(parts))
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         self._update_preview()
@@ -249,18 +313,26 @@ class EasyTransApp(App):
         if memo is None:
             self.notify("No memo selected", severity="warning")
             return
+        marked_complete = False
         with Session(self.engine) as session:
             db_memo = session.get(Memo, memo.file_hash)
             if db_memo:
                 db_memo.completed = not db_memo.completed
                 session.commit()
                 if db_memo.completed:
+                    marked_complete = True
                     self._session_completed.add(memo.file_hash)
                     self.notify(f"Marked {memo.file_id} as complete")
                 else:
                     self._session_completed.discard(memo.file_hash)
                     self.notify(f"Marked {memo.file_id} as incomplete")
         self._refresh_table()
+        # Advance cursor to next row after marking complete
+        if marked_complete:
+            table = self.query_one("#memo-table", DataTable)
+            row = table.cursor_coordinate.row
+            if row < table.row_count - 1:
+                table.move_cursor(row=row + 1)
 
     def action_play(self) -> None:
         """Play the selected memo's audio file."""
@@ -446,8 +518,8 @@ class EasyTransApp(App):
         self.notify(f"Re-transcribing {memo.file_id} with {model}...")
 
         # Immediately update Model and Preview columns to show progress
-        self._update_row_cell(memo.file_hash, 5, model)  # Model column
-        self._update_row_cell(memo.file_hash, 6, "(transcribing...)")  # Preview column
+        self._update_row_cell(memo.file_hash, 3, model)  # Model column
+        self._update_row_cell(memo.file_hash, 4, "(transcribing...)")  # Preview column
 
         self._retranscribe_worker = self._do_retranscribe(memo, model)
 

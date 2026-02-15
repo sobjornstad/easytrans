@@ -140,6 +140,90 @@ async def test_cursor_preserved_on_toggle(tmp_path: Path) -> None:
         assert app._get_selected_row_key() == "hash2"
 
 
+@pytest.mark.asyncio
+async def test_mark_complete_advances_cursor(tmp_path: Path) -> None:
+    """After marking a memo complete, cursor moves to the next row."""
+    app = _make_app(tmp_path)
+    _add_memo(app.engine, tmp_path, "hash1", "2026-0001")
+    _add_memo(app.engine, tmp_path, "hash2", "2026-0002")
+    _add_memo(app.engine, tmp_path, "hash3", "2026-0003")
+
+    async with app.run_test() as pilot:
+        # Cursor starts on first row
+        assert app._get_selected_row_key() == "hash1"
+
+        await pilot.press("d")
+        await pilot.pause()
+        # Should advance to second row
+        assert app._get_selected_row_key() == "hash2"
+
+
+@pytest.mark.asyncio
+async def test_mark_complete_stays_on_last_row(tmp_path: Path) -> None:
+    """Marking the last row complete does not move cursor past the end."""
+    app = _make_app(tmp_path)
+    _add_memo(app.engine, tmp_path, "hash1", "2026-0001")
+    _add_memo(app.engine, tmp_path, "hash2", "2026-0002")
+
+    async with app.run_test() as pilot:
+        # Move to last row
+        await pilot.press("j")
+        await pilot.pause()
+        assert app._get_selected_row_key() == "hash2"
+
+        await pilot.press("d")
+        await pilot.pause()
+        # Should stay on last row (hash2)
+        assert app._get_selected_row_key() == "hash2"
+
+
+@pytest.mark.asyncio
+async def test_column_order_wide(tmp_path: Path) -> None:
+    """On a wide terminal, all columns including dates are shown."""
+    app = _make_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        table = app.query_one("#memo-table", DataTable)
+        labels = [col.label.plain for col in table.columns.values()]
+        assert labels == ["", "ID", "Length", "Model", "Preview", "Recorded", "Transcribed"]
+
+
+@pytest.mark.asyncio
+async def test_date_columns_hidden_narrow(tmp_path: Path) -> None:
+    """On a narrow terminal, date columns are hidden."""
+    app = _make_app(tmp_path)
+    # Width 80: available=78, preview_with_dates=78-30-36-2=10 < 20 → hide dates
+    async with app.run_test(size=(80, 40)) as pilot:
+        table = app.query_one("#memo-table", DataTable)
+        labels = [col.label.plain for col in table.columns.values()]
+        assert "Recorded" not in labels
+        assert "Transcribed" not in labels
+        assert labels == ["", "ID", "Length", "Model", "Preview"]
+
+
+@pytest.mark.asyncio
+async def test_dates_in_preview_when_columns_hidden(tmp_path: Path) -> None:
+    """When date columns are hidden, dates appear in the preview pane."""
+    app = _make_app(tmp_path)
+    _add_memo(app.engine, tmp_path)
+    # Add a transcription so we have a transcribed_at date
+    with Session(app.engine) as session:
+        t = Transcription(
+            memo_hash="abc123",
+            transcribed_at=datetime(2026, 1, 15, 13, 0, tzinfo=timezone.utc),
+            model_name="tiny",
+            text="[00:00] Hello",
+        )
+        session.add(t)
+        session.commit()
+
+    async with app.run_test(size=(80, 40)) as pilot:
+        from easytrans.app import MemoPreview
+        preview = app.query_one("#preview", MemoPreview)
+        content = str(preview._Static__content)
+        assert "Recorded: 2026-01-15 10:00" in content
+        assert "Transcribed: 2026-01-15 13:00" in content
+
+
 def test_strip_front_matter() -> None:
     text = "---\nid: 2026-0001\nstatus: pending\nrecorded: 2026-01-15 10:00\n---\n\nHello world\n"
     result = EasyTransApp._strip_front_matter(text)
