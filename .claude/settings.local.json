@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(VBoxManage list:*)",
+      "Bash(VBoxManage showvminfo:*)",
+      "Bash(VBoxManage:*)"
+    ]
+  }
+}
