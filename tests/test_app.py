@@ -8,7 +8,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from textual.widgets import DataTable
 
-from easytrans.app import EasyTransApp
+from easytrans.app import EasyTransApp, GotoStatus, MemoTable
 from easytrans.config import EasyTransConfig, RecorderConfig, WhisperConfig
 from easytrans.files import text_path
 from easytrans.models import Base, Memo, Transcription
@@ -281,3 +281,315 @@ async def test_timestamp_toggle(tmp_path: Path) -> None:
         # After toggle: show timestamped text from DB
         content = str(preview._Static__content)
         assert "[00:00]" in content
+
+
+# --- Vim navigation tests ---
+
+
+def _add_many_memos(engine, tmp_path: Path, count: int = 10) -> None:
+    """Add multiple memos for navigation tests."""
+    for i in range(1, count + 1):
+        _add_memo(
+            engine, tmp_path,
+            file_hash=f"hash{i:04d}",
+            file_id=f"2026-{i:04d}",
+            text=f"Memo number {i}",
+        )
+
+
+@pytest.mark.asyncio
+async def test_gg_jumps_to_first(tmp_path: Path) -> None:
+    """gg jumps cursor to the first row."""
+    app = _make_app(tmp_path)
+    _add_many_memos(app.engine, tmp_path, 5)
+
+    async with app.run_test() as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        # Move to last row
+        await pilot.press("G")
+        await pilot.pause()
+        assert table.cursor_coordinate.row == 4
+
+        # gg to jump to first
+        await pilot.press("g", "g")
+        await pilot.pause()
+        assert table.cursor_coordinate.row == 0
+
+
+@pytest.mark.asyncio
+async def test_G_jumps_to_last(tmp_path: Path) -> None:
+    """G jumps cursor to the last row."""
+    app = _make_app(tmp_path)
+    _add_many_memos(app.engine, tmp_path, 5)
+
+    async with app.run_test() as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        assert table.cursor_coordinate.row == 0
+
+        await pilot.press("G")
+        await pilot.pause()
+        assert table.cursor_coordinate.row == 4
+
+
+@pytest.mark.asyncio
+async def test_count_j_moves_down_n_rows(tmp_path: Path) -> None:
+    """3j moves cursor down 3 rows."""
+    app = _make_app(tmp_path)
+    _add_many_memos(app.engine, tmp_path, 10)
+
+    async with app.run_test() as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        assert table.cursor_coordinate.row == 0
+
+        await pilot.press("3", "j")
+        await pilot.pause()
+        assert table.cursor_coordinate.row == 3
+
+
+@pytest.mark.asyncio
+async def test_count_k_moves_up_n_rows(tmp_path: Path) -> None:
+    """3k moves cursor up 3 rows."""
+    app = _make_app(tmp_path)
+    _add_many_memos(app.engine, tmp_path, 10)
+
+    async with app.run_test() as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        # Start at row 5
+        await pilot.press("5", "j")
+        await pilot.pause()
+        assert table.cursor_coordinate.row == 5
+
+        await pilot.press("3", "k")
+        await pilot.pause()
+        assert table.cursor_coordinate.row == 2
+
+
+@pytest.mark.asyncio
+async def test_goto_by_seq_number(tmp_path: Path) -> None:
+    """Typing a sequence number + Enter navigates to that memo."""
+    app = _make_app(tmp_path)
+    _add_many_memos(app.engine, tmp_path, 5)
+
+    async with app.run_test() as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+
+        # Type "3" + Enter → go to memo 2026-0003 (row index 2)
+        await pilot.press("3", "enter")
+        await pilot.pause()
+        assert table.cursor_coordinate.row == 2
+        assert app._get_selected_row_key() == "hash0003"
+
+
+@pytest.mark.asyncio
+async def test_goto_by_year_seq(tmp_path: Path) -> None:
+    """Typing year-seq + Enter navigates to that specific memo."""
+    app = _make_app(tmp_path)
+    _add_many_memos(app.engine, tmp_path, 5)
+
+    async with app.run_test() as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+
+        # Type "2026-4" + Enter → go to memo 2026-0004 (row index 3)
+        await pilot.press("2", "0", "2", "6", "-", "4", "enter")
+        await pilot.pause()
+        assert table.cursor_coordinate.row == 3
+        assert app._get_selected_row_key() == "hash0004"
+
+
+@pytest.mark.asyncio
+async def test_goto_status_shown_and_hidden(tmp_path: Path) -> None:
+    """Goto buffer status appears in footer area and hides when cleared."""
+    app = _make_app(tmp_path)
+    _add_many_memos(app.engine, tmp_path, 5)
+
+    async with app.run_test() as pilot:
+        status = app.query_one("#goto-status", GotoStatus)
+
+        # Initially hidden
+        assert not status.has_class("visible")
+
+        # Type a digit — status should appear
+        await pilot.press("3")
+        await pilot.pause()
+        assert status.has_class("visible")
+        assert "3" in str(status._Static__content)
+
+        # Press Escape — status should hide
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not status.has_class("visible")
+
+
+@pytest.mark.asyncio
+async def test_g_clears_goto_buffer(tmp_path: Path) -> None:
+    """Typing g while the goto buffer has digits clears the buffer."""
+    app = _make_app(tmp_path)
+    _add_many_memos(app.engine, tmp_path, 5)
+
+    async with app.run_test() as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        status = app.query_one("#goto-status", GotoStatus)
+
+        # Type "5g" — the 5 should be cleared, g becomes first press
+        await pilot.press("5")
+        await pilot.pause()
+        assert status.has_class("visible")
+
+        await pilot.press("g")
+        await pilot.pause()
+        assert not status.has_class("visible")
+        # g_pending should be set
+        assert table._g_pending is True
+
+
+@pytest.mark.asyncio
+async def test_goto_not_found_shows_input(tmp_path: Path) -> None:
+    """Goto to a non-existent ID shows what was typed."""
+    app = _make_app(tmp_path)
+    _add_many_memos(app.engine, tmp_path, 3)
+
+    async with app.run_test(notifications=True) as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+
+        # Type "99" + Enter — seq 0099 doesn't exist
+        await pilot.press("9", "9", "enter")
+        await pilot.pause()
+        # Cursor should stay where it was
+        assert table.cursor_coordinate.row == 0
+        # Notification should include what was typed
+        assert any("99" in str(n.message) for n in app._notifications)
+
+
+@pytest.mark.asyncio
+async def test_goto_hidden_completed_explains(tmp_path: Path) -> None:
+    """Goto to a completed (hidden) memo explains it's marked done."""
+    app = _make_app(tmp_path)
+    _add_many_memos(app.engine, tmp_path, 3)
+    # Mark memo 2 as completed
+    with Session(app.engine) as session:
+        memo = session.get(Memo, "hash0002")
+        memo.completed = True
+        session.commit()
+
+    async with app.run_test(notifications=True) as pilot:
+        # Refresh to hide the completed memo
+        app._refresh_table()
+        await pilot.pause()
+        table = app.query_one("#memo-table", MemoTable)
+        assert table.row_count == 2  # memo 2 is hidden
+
+        # Try to goto memo 2
+        await pilot.press("2", "enter")
+        await pilot.pause()
+        # Should explain it's done
+        assert any("done" in str(n.message) for n in app._notifications)
+
+
+@pytest.mark.asyncio
+async def test_count_j_clamps_at_end(tmp_path: Path) -> None:
+    """Count movement doesn't go past the last row."""
+    app = _make_app(tmp_path)
+    _add_many_memos(app.engine, tmp_path, 5)
+
+    async with app.run_test() as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+
+        # 99j from row 0 — should end at last row (4)
+        await pilot.press("9", "9", "j")
+        await pilot.pause()
+        assert table.cursor_coordinate.row == 4
+
+
+@pytest.mark.asyncio
+async def test_gg_on_empty_table(tmp_path: Path) -> None:
+    """gg on empty table doesn't crash."""
+    app = _make_app(tmp_path)
+
+    async with app.run_test() as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        await pilot.press("g", "g")
+        await pilot.pause()
+        # No crash — row stays at 0
+        assert table.cursor_coordinate.row == 0
+
+
+@pytest.mark.asyncio
+async def test_G_on_empty_table(tmp_path: Path) -> None:
+    """G on empty table doesn't crash."""
+    app = _make_app(tmp_path)
+
+    async with app.run_test() as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        await pilot.press("G")
+        await pilot.pause()
+        assert table.cursor_coordinate.row == 0
+
+
+@pytest.mark.asyncio
+async def test_goto_backspace_corrects_input(tmp_path: Path) -> None:
+    """Backspace removes the last character from the goto buffer."""
+    app = _make_app(tmp_path)
+    _add_many_memos(app.engine, tmp_path, 5)
+
+    async with app.run_test() as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        status = app.query_one("#goto-status", GotoStatus)
+
+        # Type "35", backspace, "4" → buffer = "34" → goto 2026-0004
+        await pilot.press("3", "5")
+        await pilot.pause()
+        assert "35" in str(status._Static__content)
+
+        await pilot.press("backspace")
+        await pilot.pause()
+        assert status.has_class("visible")
+        assert "3_" in str(status._Static__content)
+
+        await pilot.press("4")
+        await pilot.pause()
+        assert "34" in str(status._Static__content)
+
+
+@pytest.mark.asyncio
+async def test_goto_backspace_to_empty_then_enter(tmp_path: Path) -> None:
+    """Backspace to empty buffer, then Enter exits cleanly."""
+    app = _make_app(tmp_path)
+    _add_many_memos(app.engine, tmp_path, 5)
+
+    async with app.run_test() as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        status = app.query_one("#goto-status", GotoStatus)
+
+        # Type "3", backspace → empty but still active
+        await pilot.press("3")
+        await pilot.pause()
+        assert status.has_class("visible")
+
+        await pilot.press("backspace")
+        await pilot.pause()
+        assert status.has_class("visible")
+        content = str(status._Static__content)
+        assert "Go to:" in content
+
+        # Enter with empty buffer → exits cleanly, no error
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not status.has_class("visible")
+        # Cursor should stay where it was
+        assert table.cursor_coordinate.row == 0
+
+
+@pytest.mark.asyncio
+async def test_goto_backspace_to_empty_then_retype(tmp_path: Path) -> None:
+    """After backspacing to empty, can type new digits."""
+    app = _make_app(tmp_path)
+    _add_many_memos(app.engine, tmp_path, 5)
+
+    async with app.run_test() as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+
+        # Type "9", backspace, "3", Enter → go to memo 2026-0003
+        await pilot.press("9", "backspace", "3", "enter")
+        await pilot.pause()
+        assert table.cursor_coordinate.row == 2
+        assert app._get_selected_row_key() == "hash0003"

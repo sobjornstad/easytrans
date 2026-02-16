@@ -13,6 +13,8 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.coordinate import Coordinate
+from textual.events import Key
+from textual.message import Message
 from textual.widgets import DataTable, Footer, Header, Static
 
 from easytrans.config import EasyTransConfig, load_config
@@ -51,12 +53,58 @@ class MemoPreview(Static):
     """
 
 
+class GotoStatus(Static):
+    """Status bar showing the goto buffer content."""
+
+    DEFAULT_CSS = """
+    GotoStatus {
+        height: 1;
+        background: $accent;
+        color: $text;
+        display: none;
+        padding: 0 1;
+    }
+    GotoStatus.visible {
+        display: block;
+    }
+    """
+
+
 class MemoTable(DataTable):
-    """DataTable subclass with per-row red background for completed items."""
+    """DataTable subclass with vim navigation and per-row highlighting."""
+
+    class GotoStatusChanged(Message):
+        """Posted when the goto buffer changes. Empty string = hide."""
+        def __init__(self, display: str) -> None:
+            super().__init__()
+            self.display = display
+
+    class NavigateToItem(Message):
+        """Request navigation to a specific item by file_id components."""
+        def __init__(self, year: int, seq: int, raw_input: str) -> None:
+            super().__init__()
+            self.year = year
+            self.seq = seq
+            self.raw_input = raw_input
+
+    BINDINGS = [
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("G", "jump_to_last", "Last", show=False),
+        Binding("ctrl+d", "scroll_half_page_down", "Half Page Down", show=False),
+        Binding("ctrl+u", "scroll_half_page_up", "Half Page Up", show=False),
+        Binding("ctrl+f, pagedown", "scroll_page_down", "Page Down", show=False),
+        Binding("ctrl+b, pageup", "scroll_page_up", "Page Up", show=False),
+    ]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.completed_rows: set[str] = set()
+        self._g_pending: bool = False
+        self._goto_buffer: str = ""
+        self._goto_active: bool = False
+        self._goto_suspended: bool = False
+        self._skip_auto_scroll: bool = False
 
     def on_resize(self, event) -> None:
         """Rebuild table layout when the table widget itself is resized."""
@@ -77,6 +125,297 @@ class MemoTable(DataTable):
             row_index, column_index, base_style, width, cursor, hover,
         )
 
+    # --- Auto-scroll suppression ---
+
+    def _scroll_cursor_into_view(self, animate: bool = False) -> None:
+        """Override to suppress auto-scroll during vim viewport panning."""
+        if self._skip_auto_scroll:
+            return
+        super()._scroll_cursor_into_view(animate=animate)
+
+    # --- Key handling ---
+
+    def on_key(self, event: Key) -> None:
+        # gg handling — must come first
+        if event.character == "g":
+            if self._g_pending:
+                self._g_pending = False
+                self.action_jump_to_first()
+            else:
+                self._g_pending = True
+                self._clear_goto_buffer()
+            event.prevent_default()
+            event.stop()
+            return
+
+        # Any non-g key clears the g-pending state
+        self._g_pending = False
+
+        if self._goto_suspended:
+            return
+
+        # Digit and separator accumulation
+        if event.character and (event.character.isdigit() or event.character == "-"):
+            # Only allow one separator, and don't start with "-"
+            if event.character == "-" and ("-" in self._goto_buffer or not self._goto_buffer):
+                return
+            self._goto_buffer += event.character
+            self._goto_active = True
+            self.post_message(self.GotoStatusChanged(f"Go to: {self._goto_buffer}_"))
+            event.prevent_default()
+            event.stop()
+            return
+
+        # Backspace removes last character from goto buffer
+        if event.key == "backspace" and self._goto_active:
+            if self._goto_buffer:
+                self._goto_buffer = self._goto_buffer[:-1]
+            self.post_message(self.GotoStatusChanged(f"Go to: {self._goto_buffer}_"))
+            event.prevent_default()
+            event.stop()
+            return
+
+        # Enter → execute goto or exit goto mode
+        if event.key == "enter" and self._goto_active:
+            if self._goto_buffer:
+                self._execute_goto()
+            else:
+                self._clear_goto_buffer()
+            event.prevent_default()
+            event.stop()
+            return
+
+        # Count + j/k
+        if self._goto_buffer and event.character in ("j", "k"):
+            try:
+                count = int(self._goto_buffer)
+            except ValueError:
+                count = 0
+            if count > 0:
+                for _ in range(count):
+                    if event.character == "j":
+                        self.action_cursor_down()
+                    else:
+                        self.action_cursor_up()
+            self._clear_goto_buffer()
+            event.prevent_default()
+            event.stop()
+            return
+
+        # Escape clears buffer
+        if event.key == "escape" and self._goto_active:
+            self._clear_goto_buffer()
+            event.prevent_default()
+            event.stop()
+            return
+
+        # Any other key clears
+        if self._goto_active:
+            self._clear_goto_buffer()
+
+    def _clear_goto_buffer(self) -> None:
+        self._goto_buffer = ""
+        self._goto_active = False
+        self.post_message(self.GotoStatusChanged(""))
+
+    def _execute_goto(self) -> None:
+        raw_input = self._goto_buffer
+        buffer = raw_input.strip("-")
+        self._clear_goto_buffer()
+        if not buffer:
+            return
+
+        if "-" in buffer:
+            # Two-part: year-seq
+            parts = buffer.split("-", 1)
+            try:
+                year = int(parts[0])
+                seq = int(parts[1]) if parts[1] else 1
+            except ValueError:
+                return
+            self.post_message(self.NavigateToItem(year, seq, raw_input))
+        else:
+            # Single-part: just a sequence number (year=0 means any year)
+            try:
+                seq = int(buffer)
+            except ValueError:
+                return
+            self.post_message(self.NavigateToItem(0, seq, raw_input))
+
+    # --- Navigation actions ---
+
+    def action_jump_to_first(self) -> None:
+        if self.row_count > 0:
+            self.move_cursor(row=0)
+
+    def action_jump_to_last(self) -> None:
+        if self.row_count > 0:
+            self.move_cursor(row=self.row_count - 1)
+
+    # --- Viewport scrolling helpers ---
+
+    def _row_y(self, row_index: int) -> int:
+        """Scroll-relative y position of a row.
+
+        _get_row_region returns y in absolute coords (including the fixed
+        header height).  Subtracting row 0's y cancels the header offset
+        so the result is usable as a scroll_y value.
+        """
+        _, y, _, _ = self._get_row_region(row_index)
+        _, base_y, _, _ = self._get_row_region(0)
+        return y - base_y
+
+    def _get_row_height(self) -> int:
+        """Height of a single row in content lines.
+
+        Uses DataTable's internal _get_row_region for accuracy, since rows
+        may render at >1 line (e.g. wrapped text).
+        """
+        if self.row_count > 0:
+            _, _, _, height = self._get_row_region(0)
+            return max(1, height)
+        return 1
+
+    def _get_viewport_height(self) -> int:
+        """Usable viewport height in lines, excluding the fixed header."""
+        h = self.scrollable_content_region.height - self._get_fixed_offset().top
+        return max(1, h)
+
+    def _get_visible_row_count(self) -> int:
+        """Number of rows that fit in the viewport."""
+        h = self._get_viewport_height()
+        return max(1, h // self._get_row_height())
+
+    def _get_first_visible_row(self) -> int:
+        """Index of the first fully visible row."""
+        if self.row_count == 0:
+            return 0
+        sy = int(self.scroll_y)
+        for i in range(self.row_count):
+            row_top = self._row_y(i)
+            _, _, _, h = self._get_row_region(i)
+            if row_top + h > sy:
+                return i
+        return self.row_count - 1
+
+    def _get_last_fully_visible_row(self) -> int:
+        """Index of the last row whose bottom edge is within the viewport."""
+        if self.row_count == 0:
+            return 0
+        sy = int(self.scroll_y)
+        viewport_bottom = sy + self._get_viewport_height()
+        last_full = self._get_first_visible_row()
+        for i in range(last_full, self.row_count):
+            row_bottom = self._row_y(i) + self._get_row_region(i)[3]
+            if row_bottom > viewport_bottom:
+                break
+            last_full = i
+        return last_full
+
+    def _get_cursor_screen_offset(self) -> int:
+        """Cursor position relative to viewport top (in rows, not lines)."""
+        return self.cursor_coordinate.row - self._get_first_visible_row()
+
+    def _scroll_to_row_at_top(self, row: int) -> None:
+        """Scroll so `row` is at the top of the viewport."""
+        if self.row_count == 0:
+            return
+        row = max(0, min(row, self.row_count - 1))
+        self.scroll_y = float(self._row_y(row))
+        # scroll_y may be clamped to max_scroll_y by Textual, which can
+        # land mid-row.  Snap to the actual first fully-visible row so
+        # no partial row peeks above the viewport.
+        self.scroll_y = float(self._row_y(self._get_first_visible_row()))
+
+    def _scroll_and_move_cursor(self, new_row: int, new_first_visible: int) -> None:
+        """Scroll to position and update cursor without flicker."""
+        self._scroll_to_row_at_top(new_first_visible)
+        self._skip_auto_scroll = True
+        self.move_cursor(row=new_row)
+        # Defer reset so deferred _scroll_cursor_into_view calls are suppressed
+        self.call_after_refresh(self._reset_skip_auto_scroll)
+
+    def _reset_skip_auto_scroll(self) -> None:
+        self._skip_auto_scroll = False
+
+    # --- Half-page scroll ---
+
+    def action_scroll_half_page_down(self) -> None:
+        if self.row_count == 0:
+            return
+        visible = self._get_visible_row_count()
+        half = max(1, visible // 2)
+        offset = self._get_cursor_screen_offset()
+        first = self._get_first_visible_row()
+
+        max_first = max(0, self.row_count - visible)
+        new_first = min(first + half, max_first)
+
+        if new_first == first:
+            # At bottom scroll limit — move cursor instead
+            self.move_cursor(row=min(self.cursor_coordinate.row + half, self.row_count - 1))
+            return
+
+        new_row = max(0, min(new_first + offset, self.row_count - 1))
+        self._scroll_and_move_cursor(new_row, new_first)
+
+    def action_scroll_half_page_up(self) -> None:
+        if self.row_count == 0:
+            return
+        visible = self._get_visible_row_count()
+        half = max(1, visible // 2)
+        offset = self._get_cursor_screen_offset()
+        first = self._get_first_visible_row()
+
+        new_first = max(0, first - half)
+
+        if new_first == first:
+            # At top scroll limit — move cursor instead
+            self.move_cursor(row=max(self.cursor_coordinate.row - half, 0))
+            return
+
+        new_row = max(0, min(new_first + offset, self.row_count - 1))
+        self._scroll_and_move_cursor(new_row, new_first)
+
+    # --- Full-page scroll ---
+
+    def action_scroll_page_down(self) -> None:
+        if self.row_count == 0:
+            return
+        visible = self._get_visible_row_count()
+        scroll_amount = max(1, visible - 2)
+        first = self._get_first_visible_row()
+
+        max_first = max(0, self.row_count - visible)
+        new_first = min(first + scroll_amount, max_first)
+        new_row = max(0, min(new_first, self.row_count - 1))
+        self._scroll_and_move_cursor(new_row, new_first)
+
+    def action_scroll_page_up(self) -> None:
+        if self.row_count == 0:
+            return
+        visible = self._get_visible_row_count()
+        scroll_amount = max(1, visible - 2)
+        first = self._get_first_visible_row()
+
+        new_first = max(0, first - scroll_amount)
+        # Scroll first, then find the actual last fully visible row
+        # so the cursor never lands on a partially-clipped bottom row.
+        self._scroll_to_row_at_top(new_first)
+        new_row = self._get_last_fully_visible_row()
+        self._skip_auto_scroll = True
+        self.move_cursor(row=new_row)
+        self.call_after_refresh(self._reset_skip_auto_scroll)
+
+    # --- Goto suspension ---
+
+    def suspend_goto(self) -> None:
+        self._goto_suspended = True
+        self._clear_goto_buffer()
+
+    def resume_goto(self) -> None:
+        self._goto_suspended = False
+
 
 class EasyTransApp(App):
     """Main EasyTrans application."""
@@ -86,14 +425,15 @@ class EasyTransApp(App):
     #memo-table {
         height: 2fr;
     }
+    #preview-area {
+        height: 1fr;
+    }
     #preview {
         height: 1fr;
     }
     """
 
     BINDINGS = [
-        Binding("j", "cursor_down", "Down", show=False),
-        Binding("k", "cursor_up", "Up", show=False),
         Binding("s", "sync", "Sync"),
         Binding("h", "toggle_completed", "Hide/Show done"),
         Binding("e", "edit", "Edit"),
@@ -128,7 +468,9 @@ class EasyTransApp(App):
         yield Header()
         with Vertical():
             yield MemoTable(id="memo-table")
-            yield MemoPreview(id="preview")
+            with Vertical(id="preview-area"):
+                yield MemoPreview(id="preview")
+                yield GotoStatus(id="goto-status")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -294,13 +636,63 @@ class EasyTransApp(App):
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         self._update_preview()
 
-    def action_cursor_down(self) -> None:
-        table = self.query_one("#memo-table", DataTable)
-        table.action_cursor_down()
+    def on_memo_table_goto_status_changed(self, event: MemoTable.GotoStatusChanged) -> None:
+        """Show/hide goto buffer status in the footer area."""
+        status = self.query_one("#goto-status", GotoStatus)
+        if event.display:
+            status.update(event.display)
+            status.add_class("visible")
+        else:
+            status.update("")
+            status.remove_class("visible")
 
-    def action_cursor_up(self) -> None:
-        table = self.query_one("#memo-table", DataTable)
-        table.action_cursor_up()
+    def on_memo_table_navigate_to_item(self, event: MemoTable.NavigateToItem) -> None:
+        """Navigate to a memo by file_id components."""
+        table = self.query_one("#memo-table", MemoTable)
+        if event.year == 0:
+            target_suffix = f"-{event.seq:04d}"
+            target_id = None  # unknown full ID for single-part
+        else:
+            target_suffix = None
+            target_id = f"{event.year}-{event.seq:04d}"
+
+        # Search visible rows
+        for row_idx in range(table.row_count):
+            rk, _ = table.coordinate_to_cell_key(Coordinate(row_idx, 0))
+            file_id = self._get_file_id_for_key(rk.value)
+            if file_id and (
+                (target_id and file_id == target_id)
+                or (target_suffix and file_id.endswith(target_suffix))
+            ):
+                table.move_cursor(row=row_idx)
+                return
+
+        # Not in the visible list — check if it exists but is hidden (completed)
+        display_id = target_id or f"*-{event.seq:04d}"
+        with Session(self.engine) as session:
+            from sqlalchemy import select
+            query = select(Memo)
+            if target_id:
+                query = query.where(Memo.file_id == target_id)
+            else:
+                query = query.where(Memo.file_id.like(f"%-{event.seq:04d}"))
+            memo = session.execute(query).scalars().first()
+            if memo and memo.completed and not self.show_completed:
+                self.notify(
+                    f"{memo.file_id} is marked done (press h to show)",
+                    severity="warning",
+                )
+            else:
+                self.notify(
+                    f"No memo matching '{event.raw_input}'",
+                    severity="warning",
+                )
+
+    def _get_file_id_for_key(self, key_value: str) -> str | None:
+        """Look up a memo's file_id from its row key (file_hash)."""
+        with Session(self.engine) as session:
+            memo = session.get(Memo, key_value)
+            return memo.file_id if memo else None
 
     def action_toggle_completed(self) -> None:
         self.show_completed = not self.show_completed
