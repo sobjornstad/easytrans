@@ -1039,7 +1039,7 @@ class EasyTransApp(App):
                     modal.set_step, "step-mount",
                     "Mounting voice recorder...", "active",
                 )
-                # mount_recorder(self.config)  # Commented out for testing
+                mount_recorder(self.config)
                 self.call_from_thread(
                     modal.set_step, "step-mount",
                     "Mounted voice recorder", "done",
@@ -1097,7 +1097,7 @@ class EasyTransApp(App):
                     modal.set_step, "step-unmount",
                     "Unmounting recorder...", "active",
                 )
-                # unmount_recorder(self.config)  # Commented out for testing
+                unmount_recorder(self.config)
                 self.call_from_thread(
                     modal.set_step, "step-unmount",
                     "Unmounted recorder", "done",

@@ -704,7 +704,9 @@ async def test_sync_modal_set_step_updates_text(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_sync_no_new_files_closes_modal(tmp_path: Path) -> None:
+@patch("easytrans.app.unmount_recorder")
+@patch("easytrans.app.mount_recorder")
+async def test_sync_no_new_files_closes_modal(_mock_mount, _mock_umount, tmp_path: Path) -> None:
     """When no new files exist, modal shows and auto-closes."""
     app, recorder_dir = _make_app_with_recorder(tmp_path)
     # Empty recorder dir — no files to find
@@ -718,7 +720,9 @@ async def test_sync_no_new_files_closes_modal(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_sync_new_files_appear_in_table(tmp_path: Path) -> None:
+@patch("easytrans.app.unmount_recorder")
+@patch("easytrans.app.mount_recorder")
+async def test_sync_new_files_appear_in_table(_mock_mount, _mock_umount, tmp_path: Path) -> None:
     """New files from recorder should appear in the table after sync."""
     app, recorder_dir = _make_app_with_recorder(tmp_path)
     (recorder_dir / "memo1.mp3").write_bytes(b"audio data 1")
@@ -737,7 +741,9 @@ async def test_sync_new_files_appear_in_table(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_sync_shows_transcribing_status(tmp_path: Path) -> None:
+@patch("easytrans.app.unmount_recorder")
+@patch("easytrans.app.mount_recorder")
+async def test_sync_shows_transcribing_status(_mock_mount, _mock_umount, tmp_path: Path) -> None:
     """During transcription, rows should show '(transcribing...)' in Preview."""
     app, recorder_dir = _make_app_with_recorder(tmp_path)
     (recorder_dir / "memo1.mp3").write_bytes(b"audio data single")
@@ -768,7 +774,9 @@ async def test_sync_shows_transcribing_status(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_sync_updates_row_after_transcription(tmp_path: Path) -> None:
+@patch("easytrans.app.unmount_recorder")
+@patch("easytrans.app.mount_recorder")
+async def test_sync_updates_row_after_transcription(_mock_mount, _mock_umount, tmp_path: Path) -> None:
     """After transcription, the row should show the transcription text."""
     app, recorder_dir = _make_app_with_recorder(tmp_path)
     (recorder_dir / "memo1.mp3").write_bytes(b"audio data for row update")

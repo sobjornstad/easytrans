@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -26,6 +26,27 @@ class Memo(Base):
 
     def __repr__(self) -> str:
         return f"<Memo {self.file_id}>"
+
+
+class SourceFile(Base):
+    """Cached mapping from recorder file metadata to content hash.
+
+    Avoids re-reading file contents from USB on repeated syncs.
+    """
+    __tablename__ = "source_files"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    filename: Mapped[str] = mapped_column(String, nullable=False)
+    file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    mtime_ns: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    file_hash: Mapped[str] = mapped_column(
+        ForeignKey("memos.file_hash"), nullable=False,
+    )
+
+    memo: Mapped["Memo"] = relationship()
+
+    def __repr__(self) -> str:
+        return f"<SourceFile {self.filename}>"
 
 
 class Transcription(Base):
