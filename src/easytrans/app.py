@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.coordinate import Coordinate
 from textual.events import Key
 from textual.message import Message
@@ -49,17 +49,45 @@ _DATES_RENDER_W = 18 + 18           # = 36
 _CELL_PAD_RENDER = 2                # 2 * cell_padding for preview column
 
 
-class MemoPreview(Static):
-    """Preview pane showing the selected memo's transcription text."""
+class MemoPreview(VerticalScroll):
+    """Scrollable preview pane showing the selected memo's transcription text."""
 
     DEFAULT_CSS = """
     MemoPreview {
         height: 1fr;
-        padding: 1 2;
-        overflow-y: auto;
         border-top: solid $accent;
     }
+    MemoPreview:focus {
+        border-top: double $accent;
+    }
+    #preview-text {
+        padding: 1 2;
+    }
     """
+
+    BINDINGS = [
+        Binding("down, j", "scroll_down", "Scroll Down", show=False),
+        Binding("up, k", "scroll_up", "Scroll Up", show=False),
+        Binding("ctrl+d", "preview_half_page_down", "Half Page Down", show=False),
+        Binding("ctrl+u", "preview_half_page_up", "Half Page Up", show=False),
+        Binding("ctrl+f, pagedown", "page_down", "Page Down", show=False),
+        Binding("ctrl+b, pageup", "page_up", "Page Up", show=False),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="preview-text")
+
+    def update(self, content: str) -> None:
+        """Update the preview text content."""
+        self.query_one("#preview-text", Static).update(content)
+
+    def action_preview_half_page_down(self) -> None:
+        amount = max(1, self.scrollable_content_region.height // 2)
+        self.scroll_relative(y=amount, animate=False)
+
+    def action_preview_half_page_up(self) -> None:
+        amount = max(1, self.scrollable_content_region.height // 2)
+        self.scroll_relative(y=-amount, animate=False)
 
 
 class GotoStatus(Static):
@@ -167,6 +195,11 @@ class MemoTable(DataTable):
         Binding("ctrl+u", "scroll_half_page_up", "Half Page Up", show=False),
         Binding("ctrl+f, pagedown", "scroll_page_down", "Page Down", show=False),
         Binding("ctrl+b, pageup", "scroll_page_up", "Page Up", show=False),
+        # Scroll-other-pane: scroll the preview while the table is focused
+        Binding("ctrl+e", "scroll_other_down", "Scroll Preview Down", show=False),
+        Binding("ctrl+y", "scroll_other_up", "Scroll Preview Up", show=False),
+        Binding("ctrl+v", "scroll_other_page_down", "Scroll Preview Pg Down", show=False),
+        Binding("alt+v", "scroll_other_page_up", "Scroll Preview Pg Up", show=False),
     ]
 
     def __init__(self, *args, **kwargs):
@@ -479,6 +512,20 @@ class MemoTable(DataTable):
         self.move_cursor(row=new_row)
         self.call_after_refresh(self._reset_skip_auto_scroll)
 
+    # --- Scroll-other-pane actions ---
+
+    def action_scroll_other_down(self) -> None:
+        self.app.query_one("#preview").scroll_down(animate=False)
+
+    def action_scroll_other_up(self) -> None:
+        self.app.query_one("#preview").scroll_up(animate=False)
+
+    def action_scroll_other_page_down(self) -> None:
+        self.app.query_one("#preview").scroll_page_down(animate=False)
+
+    def action_scroll_other_page_up(self) -> None:
+        self.app.query_one("#preview").scroll_page_up(animate=False)
+
     # --- Goto suspension ---
 
     def suspend_goto(self) -> None:
@@ -713,6 +760,7 @@ class EasyTransApp(App):
                 parts.append("(not yet transcribed)")
 
         preview.update("\n".join(parts))
+        preview.scroll_home(animate=False)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         self._update_preview()

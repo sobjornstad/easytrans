@@ -9,9 +9,9 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from textual.coordinate import Coordinate
-from textual.widgets import DataTable
+from textual.widgets import DataTable, Static
 
-from easytrans.app import EasyTransApp, GotoStatus, MemoTable, SyncProgressModal
+from easytrans.app import EasyTransApp, GotoStatus, MemoPreview, MemoTable, SyncProgressModal
 from easytrans.config import EasyTransConfig, RecorderConfig, WhisperConfig
 from easytrans.files import compute_file_hash, text_path
 from easytrans.models import Base, Memo, Transcription
@@ -221,9 +221,8 @@ async def test_dates_in_preview_when_columns_hidden(tmp_path: Path) -> None:
         session.commit()
 
     async with app.run_test(size=(80, 40)) as pilot:
-        from easytrans.app import MemoPreview
         preview = app.query_one("#preview", MemoPreview)
-        content = str(preview._Static__content)
+        content = str(preview.query_one("#preview-text", Static)._Static__content)
         assert "Recorded: 2026-01-15 10:00" in content
         assert "Transcribed: 2026-01-15 13:00" in content
 
@@ -274,16 +273,16 @@ async def test_timestamp_toggle(tmp_path: Path) -> None:
         session.commit()
 
     async with app.run_test() as pilot:
-        from easytrans.app import MemoPreview
         preview = app.query_one("#preview", MemoPreview)
+        inner = preview.query_one("#preview-text", Static)
         # Default: show .md text (no timestamps)
-        content = str(preview._Static__content)
+        content = str(inner._Static__content)
         assert "Hello world" in content
 
         await pilot.press("t")
         await pilot.pause()
         # After toggle: show timestamped text from DB
-        content = str(preview._Static__content)
+        content = str(inner._Static__content)
         assert "[00:00]" in content
 
 
@@ -806,3 +805,297 @@ async def test_sync_updates_row_after_transcription(tmp_path: Path) -> None:
         # Model column should be updated
         model = table.get_cell_at(Coordinate(0, 3))
         assert model == "tiny"
+
+
+# --- Preview pane scrolling tests ---
+
+
+def _add_memo_long_text(engine, tmp_path: Path, lines: int = 50) -> None:
+    """Add a memo with enough text to overflow the preview pane."""
+    text = "\n".join(f"Line {i+1} of the transcription" for i in range(lines))
+    _add_memo(engine, tmp_path, text=text)
+
+
+@pytest.mark.asyncio
+async def test_preview_is_focusable(tmp_path: Path) -> None:
+    """MemoPreview has can_focus=True and can receive focus via Tab."""
+    app = _make_app(tmp_path)
+    _add_memo(app.engine, tmp_path)
+
+    async with app.run_test() as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        preview = app.query_one("#preview", MemoPreview)
+
+        # Table should have initial focus
+        assert table.has_focus
+
+        # Tab should move focus to preview
+        await pilot.press("tab")
+        await pilot.pause()
+        assert preview.has_focus
+        assert not table.has_focus
+
+        # Shift+Tab should return focus to table
+        await pilot.press("shift+tab")
+        await pilot.pause()
+        assert table.has_focus
+        assert not preview.has_focus
+
+
+@pytest.mark.asyncio
+async def test_preview_focus_border_changes(tmp_path: Path) -> None:
+    """MemoPreview shows a different border when focused."""
+    app = _make_app(tmp_path)
+    _add_memo(app.engine, tmp_path)
+
+    async with app.run_test() as pilot:
+        preview = app.query_one("#preview", MemoPreview)
+
+        # When not focused, border should be solid
+        assert not preview.has_focus
+
+        # When focused, border should be double
+        await pilot.press("tab")
+        await pilot.pause()
+        assert preview.has_focus
+
+
+@pytest.mark.asyncio
+async def test_preview_scroll_down_j(tmp_path: Path) -> None:
+    """Pressing j in focused preview scrolls down."""
+    app = _make_app(tmp_path)
+    _add_memo_long_text(app.engine, tmp_path, lines=50)
+
+    async with app.run_test(size=(120, 20)) as pilot:
+        preview = app.query_one("#preview", MemoPreview)
+
+        # Focus the preview
+        await pilot.press("tab")
+        await pilot.pause()
+        assert preview.has_focus
+
+        initial_scroll = preview.scroll_y
+
+        # Press j to scroll down
+        await pilot.press("j")
+        await pilot.pause()
+        assert preview.scroll_y > initial_scroll
+
+
+@pytest.mark.asyncio
+async def test_preview_scroll_up_k(tmp_path: Path) -> None:
+    """Pressing k in focused preview scrolls up."""
+    app = _make_app(tmp_path)
+    _add_memo_long_text(app.engine, tmp_path, lines=50)
+
+    async with app.run_test(size=(120, 20)) as pilot:
+        preview = app.query_one("#preview", MemoPreview)
+
+        # Focus the preview and scroll down first
+        await pilot.press("tab")
+        await pilot.pause()
+        for _ in range(5):
+            await pilot.press("j")
+        await pilot.pause()
+        scrolled_pos = preview.scroll_y
+        assert scrolled_pos > 0
+
+        # Press k to scroll up
+        await pilot.press("k")
+        await pilot.pause()
+        assert preview.scroll_y < scrolled_pos
+
+
+@pytest.mark.asyncio
+async def test_preview_scroll_half_page(tmp_path: Path) -> None:
+    """Ctrl+D/Ctrl+U scroll the focused preview by half a page."""
+    app = _make_app(tmp_path)
+    _add_memo_long_text(app.engine, tmp_path, lines=50)
+
+    async with app.run_test(size=(120, 20)) as pilot:
+        preview = app.query_one("#preview", MemoPreview)
+
+        await pilot.press("tab")
+        await pilot.pause()
+        assert preview.has_focus
+
+        # Ctrl+D scrolls down
+        await pilot.press("ctrl+d")
+        await pilot.pause()
+        after_down = preview.scroll_y
+        assert after_down > 0
+
+        # Ctrl+U scrolls back up
+        await pilot.press("ctrl+u")
+        await pilot.pause()
+        assert preview.scroll_y < after_down
+
+
+@pytest.mark.asyncio
+async def test_preview_scroll_full_page(tmp_path: Path) -> None:
+    """Ctrl+F/Ctrl+B scroll the focused preview by a full page."""
+    app = _make_app(tmp_path)
+    _add_memo_long_text(app.engine, tmp_path, lines=50)
+
+    async with app.run_test(size=(120, 20)) as pilot:
+        preview = app.query_one("#preview", MemoPreview)
+
+        await pilot.press("tab")
+        await pilot.pause()
+
+        # Ctrl+F scrolls down a full page
+        await pilot.press("ctrl+f")
+        await pilot.pause()
+        after_page = preview.scroll_y
+        assert after_page > 0
+
+        # Ctrl+B scrolls back up
+        await pilot.press("ctrl+b")
+        await pilot.pause()
+        assert preview.scroll_y < after_page
+
+
+@pytest.mark.asyncio
+async def test_preview_scroll_resets_on_row_change(tmp_path: Path) -> None:
+    """Selecting a different memo resets preview scroll to top."""
+    app = _make_app(tmp_path)
+    _add_memo_long_text(app.engine, tmp_path, lines=50)
+    _add_memo(app.engine, tmp_path, file_hash="hash2", file_id="2026-0002",
+              text="Short second memo")
+
+    async with app.run_test(size=(120, 20)) as pilot:
+        preview = app.query_one("#preview", MemoPreview)
+
+        # Focus preview and scroll down
+        await pilot.press("tab")
+        await pilot.pause()
+        await pilot.press("ctrl+d")
+        await pilot.pause()
+        assert preview.scroll_y > 0
+
+        # Switch back to table and move to next row
+        await pilot.press("shift+tab")
+        await pilot.pause()
+        await pilot.press("j")
+        await pilot.pause()
+
+        # Preview scroll should be reset to top
+        assert preview.scroll_y == 0
+
+
+# --- Scroll-other-pane tests ---
+
+
+@pytest.mark.asyncio
+async def test_scroll_other_ctrl_e_scrolls_preview_down(tmp_path: Path) -> None:
+    """Ctrl+E from the table scrolls preview down one line."""
+    app = _make_app(tmp_path)
+    _add_memo_long_text(app.engine, tmp_path, lines=50)
+
+    async with app.run_test(size=(120, 20)) as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        preview = app.query_one("#preview", MemoPreview)
+
+        assert table.has_focus
+        initial = preview.scroll_y
+
+        await pilot.press("ctrl+e")
+        await pilot.pause()
+        assert preview.scroll_y > initial
+        # Table should still have focus
+        assert table.has_focus
+
+
+@pytest.mark.asyncio
+async def test_scroll_other_ctrl_y_scrolls_preview_up(tmp_path: Path) -> None:
+    """Ctrl+Y from the table scrolls preview up one line."""
+    app = _make_app(tmp_path)
+    _add_memo_long_text(app.engine, tmp_path, lines=50)
+
+    async with app.run_test(size=(120, 20)) as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        preview = app.query_one("#preview", MemoPreview)
+
+        # Scroll down first
+        for _ in range(5):
+            await pilot.press("ctrl+e")
+        await pilot.pause()
+        after_down = preview.scroll_y
+        assert after_down > 0
+
+        # Ctrl+Y scrolls back up
+        await pilot.press("ctrl+y")
+        await pilot.pause()
+        assert preview.scroll_y < after_down
+        assert table.has_focus
+
+
+@pytest.mark.asyncio
+async def test_scroll_other_ctrl_v_page_down(tmp_path: Path) -> None:
+    """Ctrl+V from the table scrolls preview down one page."""
+    app = _make_app(tmp_path)
+    _add_memo_long_text(app.engine, tmp_path, lines=50)
+
+    async with app.run_test(size=(120, 20)) as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        preview = app.query_one("#preview", MemoPreview)
+
+        assert table.has_focus
+        initial = preview.scroll_y
+
+        await pilot.press("ctrl+v")
+        await pilot.pause()
+        assert preview.scroll_y > initial
+        assert table.has_focus
+
+
+@pytest.mark.asyncio
+async def test_scroll_other_alt_v_page_up(tmp_path: Path) -> None:
+    """Alt+V from the table scrolls preview up one page."""
+    app = _make_app(tmp_path)
+    _add_memo_long_text(app.engine, tmp_path, lines=50)
+
+    async with app.run_test(size=(120, 20)) as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        preview = app.query_one("#preview", MemoPreview)
+
+        # Scroll down first
+        await pilot.press("ctrl+v")
+        await pilot.pause()
+        after_page = preview.scroll_y
+        assert after_page > 0
+
+        # Alt+V scrolls back up
+        # Use escape,v sequence for Alt+V in test environment
+        await pilot.press("alt+v")
+        await pilot.pause()
+        assert preview.scroll_y < after_page
+        assert table.has_focus
+
+
+@pytest.mark.asyncio
+async def test_table_j_k_dont_scroll_when_preview_focused(tmp_path: Path) -> None:
+    """When preview is focused, j/k scroll preview, not move table cursor."""
+    app = _make_app(tmp_path)
+    # Add first memo with long text, then more short memos
+    long_text = "\n".join(f"Line {i}" for i in range(50))
+    _add_memo(app.engine, tmp_path, file_hash="hash0001", file_id="2026-0001",
+              text=long_text)
+    for i in range(2, 6):
+        _add_memo(app.engine, tmp_path, file_hash=f"hash{i:04d}",
+                  file_id=f"2026-{i:04d}", text=f"Memo {i}")
+
+    async with app.run_test(size=(120, 20)) as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+
+        # Table cursor starts at row 0
+        assert table.cursor_coordinate.row == 0
+
+        # Focus preview
+        await pilot.press("tab")
+        await pilot.pause()
+
+        # Press j — should scroll preview, NOT move table cursor
+        await pilot.press("j")
+        await pilot.pause()
+        assert table.cursor_coordinate.row == 0
