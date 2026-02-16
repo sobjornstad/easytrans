@@ -16,9 +16,9 @@ data_dir = "~/easytrans-data"
 
 [recorder]
 # Block device path for the voice recorder
-device_path = "/dev/sdb1"
+device_path = "/dev/sda1"
 # Where to mount the recorder
-mount_point = "/mnt/recorder"
+mount_point = "/media/vok"
 # Directory on the recorder containing audio files
 audio_dir = "RECORDER/FOLDER_B"
 
@@ -32,8 +32,8 @@ large_model = "medium"
 
 @dataclass
 class RecorderConfig:
-    device_path: str = "/dev/sdb1"
-    mount_point: str = "/mnt/recorder"
+    device_path: str = "/dev/sda1"
+    mount_point: str = "/media/vok"
     audio_dir: str = "RECORDER/FOLDER_B"
 
 

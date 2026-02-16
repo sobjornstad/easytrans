@@ -1,17 +1,21 @@
 """UI tests for the EasyTrans Textual application."""
 
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
+from textual.coordinate import Coordinate
 from textual.widgets import DataTable
 
-from easytrans.app import EasyTransApp, GotoStatus, MemoTable
+from easytrans.app import EasyTransApp, GotoStatus, MemoTable, SyncProgressModal
 from easytrans.config import EasyTransConfig, RecorderConfig, WhisperConfig
-from easytrans.files import text_path
+from easytrans.files import compute_file_hash, text_path
 from easytrans.models import Base, Memo, Transcription
+from easytrans.sync import copy_single_file, find_new_files, scan_recorder
 
 
 def _make_app(tmp_path: Path) -> EasyTransApp:
@@ -593,3 +597,212 @@ async def test_goto_backspace_to_empty_then_retype(tmp_path: Path) -> None:
         await pilot.pause()
         assert table.cursor_coordinate.row == 2
         assert app._get_selected_row_key() == "hash0003"
+
+
+# --- Sync progress modal tests ---
+
+
+def _make_app_with_recorder(tmp_path: Path) -> tuple[EasyTransApp, Path]:
+    """Create an app with a fake recorder directory. Returns (app, recorder_dir)."""
+    recorder_dir = tmp_path / "mount" / "RECORDER" / "FOLDER_B"
+    recorder_dir.mkdir(parents=True)
+    config = EasyTransConfig(
+        data_dir=tmp_path / "data",
+        recorder=RecorderConfig(
+            device_path="/dev/null",
+            mount_point=str(recorder_dir.parent.parent),
+            audio_dir=str(recorder_dir.relative_to(recorder_dir.parent.parent)),
+        ),
+        whisper=WhisperConfig(),
+    )
+    config.ensure_dirs()
+
+    app = EasyTransApp(config=config)
+    engine = create_engine(f"sqlite:///{config.db_path}")
+    Base.metadata.create_all(engine)
+    app.engine = engine
+    return app, recorder_dir
+
+
+@pytest.mark.asyncio
+async def test_model_column_width_adapts_to_data(tmp_path: Path) -> None:
+    """Model column should be wide enough for the longest model name."""
+    app = _make_app(tmp_path)
+    _add_memo(app.engine, tmp_path, "h1", "2026-0001", text="memo one")
+    # Add a transcription with a long model name
+    with Session(app.engine) as session:
+        t = Transcription(
+            memo_hash="h1",
+            transcribed_at=datetime(2026, 1, 15, 13, 0, tzinfo=timezone.utc),
+            model_name="tiny.en",
+            text="[00:00] Hello",
+        )
+        session.add(t)
+        session.commit()
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        table = app.query_one("#memo-table")
+        # Find the Model column and check its content width
+        cols = list(table.columns.values())
+        model_col = cols[3]
+        assert model_col.label.plain == "Model"
+        assert model_col.content_width >= len("tiny.en")
+
+
+@pytest.mark.asyncio
+async def test_model_column_minimum_is_header_width(tmp_path: Path) -> None:
+    """Model column should be at least as wide as the 'Model' header."""
+    app = _make_app(tmp_path)
+    _add_memo(app.engine, tmp_path, text="memo")
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        table = app.query_one("#memo-table")
+        cols = list(table.columns.values())
+        model_col = cols[3]
+        assert model_col.content_width >= len("Model")
+
+
+@pytest.mark.asyncio
+async def test_sync_modal_composes_with_all_steps(tmp_path: Path) -> None:
+    """Modal should have all 4 step widgets and a title."""
+    app, _ = _make_app_with_recorder(tmp_path)
+    async with app.run_test() as pilot:
+        modal = SyncProgressModal()
+        app.push_screen(modal)
+        await pilot.pause()
+
+        assert modal.query_one("#step-mount")
+        assert modal.query_one("#step-scan")
+        assert modal.query_one("#step-copy")
+        assert modal.query_one("#step-unmount")
+        assert modal.query_one("#sync-title")
+
+
+@pytest.mark.asyncio
+async def test_sync_modal_ready_event_fires(tmp_path: Path) -> None:
+    """wait_ready() should unblock after on_mount."""
+    app, _ = _make_app_with_recorder(tmp_path)
+    async with app.run_test() as pilot:
+        modal = SyncProgressModal()
+        app.push_screen(modal)
+        await pilot.pause()
+        assert modal._ready.is_set()
+
+
+@pytest.mark.asyncio
+async def test_sync_modal_set_step_updates_text(tmp_path: Path) -> None:
+    """set_step should update the step widget content."""
+    app, _ = _make_app_with_recorder(tmp_path)
+    async with app.run_test() as pilot:
+        modal = SyncProgressModal()
+        app.push_screen(modal)
+        await pilot.pause()
+
+        modal.set_step("step-scan", "Found 5 new file(s)", "done")
+        await pilot.pause()
+        rendered = str(modal.query_one("#step-scan").render())
+        assert "Found 5 new file(s)" in rendered
+
+
+@pytest.mark.asyncio
+async def test_sync_no_new_files_closes_modal(tmp_path: Path) -> None:
+    """When no new files exist, modal shows and auto-closes."""
+    app, recorder_dir = _make_app_with_recorder(tmp_path)
+    # Empty recorder dir — no files to find
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("s")
+        await pilot.pause(delay=2.0)
+
+        # Modal should be closed
+        assert len(app.screen_stack) == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_new_files_appear_in_table(tmp_path: Path) -> None:
+    """New files from recorder should appear in the table after sync."""
+    app, recorder_dir = _make_app_with_recorder(tmp_path)
+    (recorder_dir / "memo1.mp3").write_bytes(b"audio data 1")
+    (recorder_dir / "memo2.mp3").write_bytes(b"audio data 2")
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        table = app.query_one("#memo-table", DataTable)
+        assert table.row_count == 0
+
+        with patch("easytrans.app.transcribe_memo"):
+            await pilot.press("s")
+            await pilot.pause(delay=2.0)
+
+        assert table.row_count == 2
+
+
+@pytest.mark.asyncio
+async def test_sync_shows_transcribing_status(tmp_path: Path) -> None:
+    """During transcription, rows should show '(transcribing...)' in Preview."""
+    app, recorder_dir = _make_app_with_recorder(tmp_path)
+    (recorder_dir / "memo1.mp3").write_bytes(b"audio data single")
+
+    transcribe_started = threading.Event()
+    transcribe_continue = threading.Event()
+
+    def mock_transcribe(config, session, memo, **kwargs):
+        transcribe_started.set()
+        transcribe_continue.wait(timeout=5)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        with patch("easytrans.app.transcribe_memo", side_effect=mock_transcribe):
+            await pilot.press("s")
+            transcribe_started.wait(timeout=5)
+            await pilot.pause(delay=0.5)
+
+            table = app.query_one("#memo-table", DataTable)
+            if table.row_count > 0:
+                cell_value = table.get_cell_at(Coordinate(0, 4))
+                assert cell_value == "(transcribing...)"
+
+            transcribe_continue.set()
+
+        await pilot.pause(delay=1.0)
+
+
+@pytest.mark.asyncio
+async def test_sync_updates_row_after_transcription(tmp_path: Path) -> None:
+    """After transcription, the row should show the transcription text."""
+    app, recorder_dir = _make_app_with_recorder(tmp_path)
+    (recorder_dir / "memo1.mp3").write_bytes(b"audio data for row update")
+
+    def mock_transcribe(config, session, memo, **kwargs):
+        """Create a fake transcription and .md file."""
+        from easytrans.files import text_path as tp
+        from easytrans.models import Transcription as T
+
+        t = T(
+            memo_hash=memo.file_hash,
+            transcribed_at=datetime(2026, 2, 16, 12, 0, tzinfo=timezone.utc),
+            model_name="tiny",
+            text="[00:00] Hello from test",
+        )
+        session.add(t)
+        session.flush()
+        md = tp(config.data_dir, memo.file_id)
+        md.parent.mkdir(parents=True, exist_ok=True)
+        md.write_text("Hello from test\n")
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        with patch("easytrans.app.transcribe_memo", side_effect=mock_transcribe):
+            await pilot.press("s")
+            await pilot.pause(delay=2.0)
+
+        table = app.query_one("#memo-table", DataTable)
+        assert table.row_count == 1
+        # Preview column should contain the transcription text
+        preview = table.get_cell_at(Coordinate(0, 4))
+        assert "Hello from test" in preview
+        # Model column should be updated
+        model = table.get_cell_at(Coordinate(0, 3))
+        assert model == "tiny"

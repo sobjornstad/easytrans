@@ -40,7 +40,7 @@ def mount_recorder(config: EasyTransConfig) -> None:
     mount_point = Path(config.recorder.mount_point)
     mount_point.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["mount", config.recorder.device_path, str(mount_point)],
+        ["sudo", "mount", config.recorder.device_path, str(mount_point)],
         check=True,
     )
 
@@ -48,7 +48,7 @@ def mount_recorder(config: EasyTransConfig) -> None:
 def unmount_recorder(config: EasyTransConfig) -> None:
     """Unmount the voice recorder device."""
     subprocess.run(
-        ["umount", config.recorder.mount_point],
+        ["sudo", "umount", config.recorder.mount_point],
         check=True,
     )
 
@@ -111,6 +111,58 @@ def sync_files(
     return new_memos
 
 
+def find_new_files(
+    session: Session,
+    recorder_files: list[Path],
+) -> list[tuple[Path, str]]:
+    """Check which recorder files haven't been synced yet.
+
+    Returns list of (path, file_hash) tuples for new files.
+    """
+    new = []
+    for f in recorder_files:
+        file_hash = compute_file_hash(f)
+        if not hash_exists(session, file_hash):
+            new.append((f, file_hash))
+    return new
+
+
+def copy_single_file(
+    config: EasyTransConfig,
+    session: Session,
+    src_file: Path,
+    file_hash: str,
+) -> Memo:
+    """Copy a single recording from the recorder to the data directory.
+
+    Returns the newly created Memo (flushed but not committed).
+    """
+    stat = src_file.stat()
+    recorded_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+    year = recorded_at.year
+
+    file_id = next_file_id(config.audio_dir, year)
+    ext = src_file.suffix
+
+    dest = audio_path(config.data_dir, file_id, ext)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_file, dest)
+
+    duration = get_audio_duration(dest)
+
+    memo = Memo(
+        file_hash=file_hash,
+        file_id=file_id,
+        recorded_at=recorded_at,
+        synced_at=datetime.now(tz=timezone.utc),
+        duration_seconds=duration,
+        completed=False,
+    )
+    session.add(memo)
+    session.flush()
+    return memo
+
+
 def run_sync(config: EasyTransConfig, session: Session) -> list[Memo]:
     """Full sync workflow: mount, scan, copy, unmount.
 
@@ -119,12 +171,11 @@ def run_sync(config: EasyTransConfig, session: Session) -> list[Memo]:
     """
     config.ensure_dirs()
 
-    # mount_recorder(config)
+    mount_recorder(config)
     try:
         recorder_files = scan_recorder(config)
         new_memos = sync_files(config, session, recorder_files)
     finally:
-        pass
-        # unmount_recorder(config)
+        unmount_recorder(config)
 
     return new_memos

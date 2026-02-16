@@ -1,8 +1,10 @@
 """Textual TUI application for EasyTrans."""
 
 import os
+import signal
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 from rich.style import Style as RichStyle
@@ -15,13 +17,20 @@ from textual.containers import Vertical
 from textual.coordinate import Coordinate
 from textual.events import Key
 from textual.message import Message
+from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Static
 
 from easytrans.config import EasyTransConfig, load_config
 from easytrans.db import get_engine, get_memos, get_latest_transcription
 from easytrans.files import find_source_audio, text_path
 from easytrans.models import Memo
-from easytrans.sync import run_sync, scan_recorder
+from easytrans.sync import (
+    copy_single_file,
+    find_new_files,
+    mount_recorder,
+    scan_recorder,
+    unmount_recorder,
+)
 from easytrans.transcribe import transcribe_memo
 
 # Status indicators
@@ -32,8 +41,8 @@ CIRCLE_FILLED = "\u25cf"  # ●
 # Status: content=1, render=3
 # ID: content=9, render=11
 # Length: content=6, render=8
-# Model: content=6, render=8
-_FIXED_RENDER_W = 3 + 11 + 8 + 8   # = 30
+# Model: dynamic (see _refresh_table)
+_FIXED_RENDER_W_BASE = 3 + 11 + 8   # = 22 (without Model)
 # Recorded: content=16, render=18
 # Transcribed: content=16, render=18
 _DATES_RENDER_W = 18 + 18           # = 36
@@ -68,6 +77,69 @@ class GotoStatus(Static):
         display: block;
     }
     """
+
+
+class SyncProgressModal(ModalScreen):
+    """Modal showing sync progress with checkable steps."""
+
+    DEFAULT_CSS = """
+    SyncProgressModal {
+        align: center middle;
+    }
+    #sync-modal-container {
+        width: 50;
+        height: auto;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #sync-title {
+        text-align: center;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    """
+
+    STEP_ICONS = {
+        "pending": "[dim]\u25cb[/dim]",
+        "active": "[yellow]\u25cf[/yellow]",
+        "done": "[green]\u2713[/green]",
+        "error": "[red]\u2717[/red]",
+    }
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._ready = threading.Event()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="sync-modal-container"):
+            yield Static("Syncing Voice Recorder", id="sync-title")
+            yield Static("", id="step-mount")
+            yield Static("", id="step-scan")
+            yield Static("", id="step-copy")
+            yield Static("", id="step-unmount")
+
+    def on_mount(self) -> None:
+        self.set_step("step-mount", "Mounting voice recorder...", "pending")
+        self.set_step("step-scan", "Scanning for unsynced files...", "pending")
+        self.set_step("step-copy", "Copying files...", "pending")
+        self.set_step("step-unmount", "Unmounting recorder...", "pending")
+        self._ready.set()
+
+    def wait_ready(self, timeout: float = 5.0) -> None:
+        """Block until the modal is mounted and ready for updates."""
+        self._ready.wait(timeout=timeout)
+
+    def set_step(self, step_id: str, text: str, status: str) -> None:
+        """Update a step's display text and status icon."""
+        icon = self.STEP_ICONS.get(status, "\u25cb")
+        if status == "pending":
+            display = f"  {icon} [dim]{text}[/dim]"
+        elif status == "error":
+            display = f"  {icon} [red]{text}[/red]"
+        else:
+            display = f"  {icon} {text}"
+        self.query_one(f"#{step_id}", Static).update(display)
 
 
 class MemoTable(DataTable):
@@ -506,80 +578,89 @@ class EasyTransApp(App):
         table = self.query_one("#memo-table", DataTable)
         saved_key = self._get_selected_row_key()
 
-        # Calculate available width for columns
-        # Use the table's own width (more reliable during resize)
-        available = table.size.width or self.size.width
-        if available <= 0:
-            available = 120
-        available -= 2  # vertical scrollbar gutter
-
-        # Decide whether to show date columns based on Preview space
-        preview_w_with_dates = available - _FIXED_RENDER_W - _DATES_RENDER_W - _CELL_PAD_RENDER
-        self._show_date_columns = preview_w_with_dates >= 20
-
-        if self._show_date_columns:
-            preview_content_w = preview_w_with_dates
-        else:
-            preview_content_w = available - _FIXED_RENDER_W - _CELL_PAD_RENDER
-        preview_content_w = max(preview_content_w, 10)
-
-        # Rebuild columns
-        table.clear(columns=True)
-        table.add_column("", width=1)
-        table.add_column("ID", width=9)
-        table.add_column("Length", width=6)
-        table.add_column("Model", width=6)
-        table.add_column("Preview", width=preview_content_w)
-        if self._show_date_columns:
-            table.add_column("Recorded", width=16)
-            table.add_column("Transcribed", width=16)
+        # --- Collect row data first so we can size columns dynamically ---
+        rows: list[tuple[str, list]] = []  # (file_hash, [cells...])
+        model_width = len("Model")  # minimum = header label width
 
         with Session(self.engine) as session:
-            # Include completed memos if toggled, plus any completed this session
             memos = get_memos(session, include_completed=self.show_completed)
             shown_hashes = {m.file_hash for m in memos}
 
-            # Add session-completed memos that aren't already in the list
             if not self.show_completed:
                 for h in self._session_completed:
                     if h not in shown_hashes:
                         memo = session.get(Memo, h)
                         if memo:
                             memos.append(memo)
-                # Re-sort by file_id
                 memos.sort(key=lambda m: m.file_id)
 
             for memo in memos:
                 status = CIRCLE_FILLED if memo.completed else CIRCLE_OPEN
                 recorded = memo.recorded_at.strftime("%Y-%m-%d %H:%M")
-                # Format duration as MM:SS
                 if memo.duration_seconds is not None:
                     mins = int(memo.duration_seconds) // 60
                     secs = int(memo.duration_seconds) % 60
                     length = f"{mins}:{secs:02d}"
                 else:
                     length = ""
-                # Get latest transcription info
                 latest = get_latest_transcription(session, memo.file_hash)
                 model = latest.model_name if latest else ""
                 transcribed = (
                     latest.transcribed_at.strftime("%Y-%m-%d %H:%M")
                     if latest else ""
                 )
-                # Read first line from .md file for preview
                 md = text_path(self.config.data_dir, memo.file_id)
-                preview = ""
+                preview_text = ""
                 if md.exists():
                     text = md.read_text().strip()
-                    first_line = text.split("\n")[0] if text else ""
-                    # Show at least 60 chars (wrapping if needed), but
-                    # if the column is wider than 60, fill without wrapping.
-                    max_chars = max(60, preview_content_w)
-                    preview = first_line[:max_chars]
-                cells = [status, memo.file_id, length, model, preview]
-                if self._show_date_columns:
-                    cells.extend([recorded, transcribed])
-                table.add_row(*cells, key=memo.file_hash, height=None)
+                    preview_text = text.split("\n")[0] if text else ""
+
+                if len(model) > model_width:
+                    model_width = len(model)
+
+                rows.append((
+                    memo.file_hash,
+                    [status, memo.file_id, length, model,
+                     preview_text, recorded, transcribed],
+                ))
+
+        # --- Compute column widths ---
+        model_render_w = model_width + _CELL_PAD_RENDER
+        fixed_render_w = _FIXED_RENDER_W_BASE + model_render_w
+
+        available = table.size.width or self.size.width
+        if available <= 0:
+            available = 120
+        available -= 2  # vertical scrollbar gutter
+
+        preview_w_with_dates = available - fixed_render_w - _DATES_RENDER_W - _CELL_PAD_RENDER
+        self._show_date_columns = preview_w_with_dates >= 20
+
+        if self._show_date_columns:
+            preview_content_w = preview_w_with_dates
+        else:
+            preview_content_w = available - fixed_render_w - _CELL_PAD_RENDER
+        preview_content_w = max(preview_content_w, 10)
+
+        # --- Build columns ---
+        table.clear(columns=True)
+        table.add_column("", width=1)
+        table.add_column("ID", width=9)
+        table.add_column("Length", width=6)
+        table.add_column("Model", width=model_width)
+        table.add_column("Preview", width=preview_content_w)
+        if self._show_date_columns:
+            table.add_column("Recorded", width=16)
+            table.add_column("Transcribed", width=16)
+
+        # --- Add rows ---
+        for file_hash, cells in rows:
+            # Truncate preview to available width
+            max_chars = max(60, preview_content_w)
+            cells[4] = cells[4][:max_chars]
+            if not self._show_date_columns:
+                cells = cells[:5]
+            table.add_row(*cells, key=file_hash, height=None)
 
         self._move_cursor_to_key(saved_key)
         self._update_preview()
@@ -740,7 +821,13 @@ class EasyTransApp(App):
         for cmd in (["ffplay", "-nodisp", "-autoexit"], ["mpv", "--no-video"], ["aplay"]):
             try:
                 with self.suspend():
-                    subprocess.run(cmd + [str(src)])
+                    # Ignore SIGINT in the parent so Ctrl+C kills only the
+                    # audio player, not the Textual app.
+                    old_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+                    try:
+                        subprocess.run(cmd + [str(src)])
+                    finally:
+                        signal.signal(signal.SIGINT, old_handler)
                 return
             except FileNotFoundError:
                 continue
@@ -845,50 +932,132 @@ class EasyTransApp(App):
                 continue
         self.notify("No clipboard tool found (install xclip)", severity="warning")
 
-    @work(thread=True)
     def action_sync(self) -> None:
         """Sync files from recorder and transcribe new memos."""
-        self.notify("Starting sync...")
+        modal = SyncProgressModal()
+        self.push_screen(modal)
+        self._do_sync(modal)
+
+    @work(thread=True, exclusive=True, group="sync")
+    def _do_sync(self, modal: SyncProgressModal) -> None:
+        """Background worker that drives the sync and transcription flow."""
+        modal.wait_ready()
+        new_memos: list[Memo] = []
+
         with Session(self.engine) as session:
-            new_memos = run_sync(self.config, session)
-            session.commit()
+            try:
+                # Step 1: Mount
+                self.call_from_thread(
+                    modal.set_step, "step-mount",
+                    "Mounting voice recorder...", "active",
+                )
+                # mount_recorder(self.config)  # Commented out for testing
+                self.call_from_thread(
+                    modal.set_step, "step-mount",
+                    "Mounted voice recorder", "done",
+                )
 
-            if not new_memos:
-                self.call_from_thread(self.notify, "No new recordings found")
-                self.call_from_thread(self._refresh_table)
-                return
+                # Step 2: Scan
+                self.call_from_thread(
+                    modal.set_step, "step-scan",
+                    "Scanning for unsynced files...", "active",
+                )
+                recorder_files = scan_recorder(self.config)
+                new_files = find_new_files(session, recorder_files)
+                total = len(new_files)
+                if total > 0:
+                    self.call_from_thread(
+                        modal.set_step, "step-scan",
+                        f"Found {total} new file(s)", "done",
+                    )
+                else:
+                    self.call_from_thread(
+                        modal.set_step, "step-scan",
+                        "No new recordings found", "done",
+                    )
 
-            self.call_from_thread(
-                self.notify,
-                f"Found {len(new_memos)} new recording(s), transcribing...",
-            )
+                # Step 3: Copy
+                if total > 0:
+                    self.call_from_thread(
+                        modal.set_step, "step-copy",
+                        f"Copying files (0/{total})...", "active",
+                    )
+                    for i, (src, file_hash) in enumerate(new_files, 1):
+                        if self._shutting_down.is_set():
+                            return
+                        memo = copy_single_file(
+                            self.config, session, src, file_hash,
+                        )
+                        new_memos.append(memo)
+                        self.call_from_thread(
+                            modal.set_step, "step-copy",
+                            f"Copying files ({i}/{total})...", "active",
+                        )
+                    session.commit()
+                    self.call_from_thread(
+                        modal.set_step, "step-copy",
+                        f"Copied {total} file(s)", "done",
+                    )
+                else:
+                    self.call_from_thread(
+                        modal.set_step, "step-copy",
+                        "No files to copy", "done",
+                    )
+
+                # Step 4: Unmount
+                self.call_from_thread(
+                    modal.set_step, "step-unmount",
+                    "Unmounting recorder...", "active",
+                )
+                # unmount_recorder(self.config)  # Commented out for testing
+                self.call_from_thread(
+                    modal.set_step, "step-unmount",
+                    "Unmounted recorder", "done",
+                )
+
+            except Exception as e:
+                self.call_from_thread(
+                    self.notify,
+                    f"Sync error: {e}",
+                    severity="error",
+                )
+
+            # Brief pause so user can see final state
+            time.sleep(0.5)
+
+            # Close the modal
+            self.call_from_thread(self.pop_screen)
+
+            # Refresh table to show new (untranscribed) memos
             self.call_from_thread(self._refresh_table)
 
+            if not new_memos:
+                return
+
+            # Transcribe each memo, updating table rows as each completes
             for memo in new_memos:
                 if self._shutting_down.is_set():
                     return
                 try:
+                    self.call_from_thread(
+                        self._update_row_cell,
+                        memo.file_hash, 4, "(transcribing...)",
+                    )
                     transcribe_memo(
                         self.config, session, memo,
                         active_processes=self._active_processes,
                     )
                     session.commit()
                     self.call_from_thread(
-                        self.notify, f"Transcribed {memo.file_id}"
+                        self._update_memo_row, memo,
                     )
                 except Exception as e:
                     if self._shutting_down.is_set():
                         return
                     self.call_from_thread(
-                        self.notify,
-                        f"Error transcribing {memo.file_id}: {e}",
-                        severity="error",
+                        self._update_row_cell,
+                        memo.file_hash, 4, f"(error: {e})",
                     )
-
-            self.call_from_thread(self._refresh_table)
-            self.call_from_thread(
-                self.notify, "Sync complete!"
-            )
 
     def _update_row_cell(self, row_key_value: str, col_idx: int, value: str) -> None:
         """Update a single cell in the table by row key and column index."""
@@ -898,6 +1067,31 @@ class EasyTransApp(App):
             if rk.value == row_key_value:
                 table.update_cell_at(Coordinate(row_idx, col_idx), value)
                 return
+
+    def _update_memo_row(self, memo: Memo) -> None:
+        """Update a memo's table row cells after transcription completes."""
+        with Session(self.engine) as session:
+            latest = get_latest_transcription(session, memo.file_hash)
+        if not latest:
+            return
+        # Update Model column
+        self._update_row_cell(memo.file_hash, 3, latest.model_name)
+        # Update Preview column from .md file
+        md = text_path(self.config.data_dir, memo.file_id)
+        preview = ""
+        if md.exists():
+            text = md.read_text().strip()
+            first_line = text.split("\n")[0] if text else ""
+            preview = first_line[:100]
+        self._update_row_cell(memo.file_hash, 4, preview)
+        # Update Transcribed date if date columns are visible
+        if self._show_date_columns:
+            self._update_row_cell(
+                memo.file_hash, 6,
+                latest.transcribed_at.strftime("%Y-%m-%d %H:%M"),
+            )
+        # Update preview pane if this memo is currently selected
+        self._update_preview()
 
     def action_retranscribe(self) -> None:
         """Re-transcribe the selected memo with the larger model."""
