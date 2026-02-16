@@ -21,7 +21,7 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Static
 
 from easytrans.config import EasyTransConfig, load_config
-from easytrans.db import get_engine, get_memos, get_latest_transcription
+from easytrans.db import get_engine, get_memos, get_latest_transcription, get_untranscribed_memos
 from easytrans.files import find_source_audio, text_path
 from easytrans.models import Memo
 from easytrans.sync import (
@@ -597,6 +597,46 @@ class EasyTransApp(App):
         table.cursor_type = "row"
         table.completed_rows = self._session_completed
         self._refresh_table()
+        self._start_pending_transcriptions()
+
+    def _start_pending_transcriptions(self) -> None:
+        """Check for memos without transcriptions and kick off transcription."""
+        with Session(self.engine) as session:
+            pending = get_untranscribed_memos(session)
+            if not pending:
+                return
+            # Detach memos from session so the worker can use them
+            for m in pending:
+                session.expunge(m)
+        count = len(pending)
+        self.notify(f"Transcribing {count} pending memo(s)...")
+        self._do_startup_transcribe(pending)
+
+    @work(thread=True, exclusive=True, group="sync")
+    def _do_startup_transcribe(self, memos: list[Memo]) -> None:
+        """Background worker to transcribe memos that lack transcriptions."""
+        with Session(self.engine) as session:
+            for memo in memos:
+                if self._shutting_down.is_set():
+                    return
+                try:
+                    self.call_from_thread(
+                        self._update_row_cell,
+                        memo.file_hash, 4, "(transcribing...)",
+                    )
+                    transcribe_memo(
+                        self.config, session, memo,
+                        active_processes=self._active_processes,
+                    )
+                    session.commit()
+                    self.call_from_thread(self._update_memo_row, memo)
+                except Exception as e:
+                    if self._shutting_down.is_set():
+                        return
+                    self.call_from_thread(
+                        self._update_row_cell,
+                        memo.file_hash, 4, f"(error: {e})",
+                    )
 
     def _get_selected_row_key(self) -> str | None:
         """Get the row key value for the currently selected row."""

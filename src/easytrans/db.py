@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, exists, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -64,6 +64,22 @@ def get_transcriptions(session: Session, memo_hash: str) -> list[Transcription]:
         select(Transcription)
         .where(Transcription.memo_hash == memo_hash)
         .order_by(Transcription.transcribed_at)
+    )
+    return list(session.scalars(stmt).all())
+
+
+def get_untranscribed_memos(session: Session) -> list[Memo]:
+    """Get all memos that have no transcriptions, ordered by file_id."""
+    stmt = (
+        select(Memo)
+        .where(
+            ~exists(
+                select(Transcription.id).where(
+                    Transcription.memo_hash == Memo.file_hash
+                )
+            )
+        )
+        .order_by(Memo.file_id)
     )
     return list(session.scalars(stmt).all())
 

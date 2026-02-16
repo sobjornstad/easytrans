@@ -4,7 +4,13 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from easytrans.db import get_memos, get_transcriptions, get_latest_transcription, hash_exists
+from easytrans.db import (
+    get_memos,
+    get_transcriptions,
+    get_latest_transcription,
+    get_untranscribed_memos,
+    hash_exists,
+)
 from easytrans.models import Memo, Transcription
 
 
@@ -115,3 +121,68 @@ def test_get_latest_transcription(db_session: Session) -> None:
 
 def test_get_latest_transcription_none(db_session: Session) -> None:
     assert get_latest_transcription(db_session, "nonexistent") is None
+
+
+def test_get_untranscribed_memos_returns_memos_without_transcriptions(
+    db_session: Session,
+) -> None:
+    m1 = _make_memo("hash1", "2026-0001")
+    m2 = _make_memo("hash2", "2026-0002")
+    db_session.add_all([m1, m2])
+    db_session.flush()
+
+    result = get_untranscribed_memos(db_session)
+    assert len(result) == 2
+    assert [m.file_id for m in result] == ["2026-0001", "2026-0002"]
+
+
+def test_get_untranscribed_memos_excludes_transcribed(db_session: Session) -> None:
+    m1 = _make_memo("hash1", "2026-0001")
+    m2 = _make_memo("hash2", "2026-0002")
+    db_session.add_all([m1, m2])
+    db_session.flush()
+
+    # Add a transcription for m1 only
+    t = Transcription(
+        memo_hash="hash1",
+        transcribed_at=datetime(2026, 1, 15, 13, 0, tzinfo=timezone.utc),
+        model_name="tiny",
+        text="hello",
+    )
+    db_session.add(t)
+    db_session.flush()
+
+    result = get_untranscribed_memos(db_session)
+    assert len(result) == 1
+    assert result[0].file_hash == "hash2"
+
+
+def test_get_untranscribed_memos_empty_when_all_transcribed(
+    db_session: Session,
+) -> None:
+    m1 = _make_memo("hash1", "2026-0001")
+    db_session.add(m1)
+    db_session.flush()
+
+    t = Transcription(
+        memo_hash="hash1",
+        transcribed_at=datetime(2026, 1, 15, 13, 0, tzinfo=timezone.utc),
+        model_name="tiny",
+        text="hello",
+    )
+    db_session.add(t)
+    db_session.flush()
+
+    result = get_untranscribed_memos(db_session)
+    assert len(result) == 0
+
+
+def test_get_untranscribed_memos_ordered_by_file_id(db_session: Session) -> None:
+    m1 = _make_memo("hash1", "2026-0003")
+    m2 = _make_memo("hash2", "2026-0001")
+    m3 = _make_memo("hash3", "2026-0002")
+    db_session.add_all([m1, m2, m3])
+    db_session.flush()
+
+    result = get_untranscribed_memos(db_session)
+    assert [m.file_id for m in result] == ["2026-0001", "2026-0002", "2026-0003"]

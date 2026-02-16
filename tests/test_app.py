@@ -1099,3 +1099,122 @@ async def test_table_j_k_dont_scroll_when_preview_focused(tmp_path: Path) -> Non
         await pilot.press("j")
         await pilot.pause()
         assert table.cursor_coordinate.row == 0
+
+
+# --- Startup transcription tests ---
+
+
+def _add_memo_no_transcription(
+    engine,
+    tmp_path: Path,
+    file_hash: str = "abc123",
+    file_id: str = "2026-0001",
+) -> None:
+    """Add a memo WITHOUT a transcription or .md file (simulates interrupted sync)."""
+    with Session(engine) as session:
+        memo = Memo(
+            file_hash=file_hash,
+            file_id=file_id,
+            recorded_at=datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc),
+            synced_at=datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc),
+            completed=False,
+        )
+        session.add(memo)
+        session.commit()
+
+
+@pytest.mark.asyncio
+async def test_startup_transcribes_untranscribed_memos(tmp_path: Path) -> None:
+    """On startup, memos without transcriptions get auto-transcribed."""
+    app = _make_app(tmp_path)
+    _add_memo_no_transcription(app.engine, tmp_path, "hash1", "2026-0001")
+    _add_memo_no_transcription(app.engine, tmp_path, "hash2", "2026-0002")
+
+    transcribed_hashes = []
+
+    def mock_transcribe(config, session, memo, **kwargs):
+        transcribed_hashes.append(memo.file_hash)
+        # Create a fake transcription
+        t = Transcription(
+            memo_hash=memo.file_hash,
+            transcribed_at=datetime(2026, 2, 16, 12, 0, tzinfo=timezone.utc),
+            model_name="tiny",
+            text="[00:00] Auto transcribed",
+        )
+        session.add(t)
+        session.flush()
+        md = text_path(config.data_dir, memo.file_id)
+        md.parent.mkdir(parents=True, exist_ok=True)
+        md.write_text("Auto transcribed\n")
+
+    with patch("easytrans.app.transcribe_memo", side_effect=mock_transcribe):
+        async with app.run_test() as pilot:
+            await pilot.pause(delay=2.0)
+
+    assert sorted(transcribed_hashes) == ["hash1", "hash2"]
+
+
+@pytest.mark.asyncio
+async def test_startup_skips_already_transcribed_memos(tmp_path: Path) -> None:
+    """On startup, memos that already have transcriptions are NOT re-transcribed."""
+    app = _make_app(tmp_path)
+    # This one has a transcription
+    _add_memo(app.engine, tmp_path, "hash1", "2026-0001", text="Already done")
+    with Session(app.engine) as session:
+        t = Transcription(
+            memo_hash="hash1",
+            transcribed_at=datetime(2026, 1, 15, 13, 0, tzinfo=timezone.utc),
+            model_name="tiny",
+            text="[00:00] Already done",
+        )
+        session.add(t)
+        session.commit()
+
+    # This one does NOT have a transcription
+    _add_memo_no_transcription(app.engine, tmp_path, "hash2", "2026-0002")
+
+    transcribed_hashes = []
+
+    def mock_transcribe(config, session, memo, **kwargs):
+        transcribed_hashes.append(memo.file_hash)
+        t = Transcription(
+            memo_hash=memo.file_hash,
+            transcribed_at=datetime(2026, 2, 16, 12, 0, tzinfo=timezone.utc),
+            model_name="tiny",
+            text="[00:00] Newly transcribed",
+        )
+        session.add(t)
+        session.flush()
+        md = text_path(config.data_dir, memo.file_id)
+        md.parent.mkdir(parents=True, exist_ok=True)
+        md.write_text("Newly transcribed\n")
+
+    with patch("easytrans.app.transcribe_memo", side_effect=mock_transcribe):
+        async with app.run_test() as pilot:
+            await pilot.pause(delay=2.0)
+
+    # Only hash2 should have been transcribed
+    assert transcribed_hashes == ["hash2"]
+
+
+@pytest.mark.asyncio
+async def test_startup_no_notification_when_all_transcribed(tmp_path: Path) -> None:
+    """No notification if all memos already have transcriptions."""
+    app = _make_app(tmp_path)
+    _add_memo(app.engine, tmp_path, "hash1", "2026-0001", text="Done")
+    with Session(app.engine) as session:
+        t = Transcription(
+            memo_hash="hash1",
+            transcribed_at=datetime(2026, 1, 15, 13, 0, tzinfo=timezone.utc),
+            model_name="tiny",
+            text="[00:00] Done",
+        )
+        session.add(t)
+        session.commit()
+
+    with patch("easytrans.app.transcribe_memo") as mock_tm:
+        async with app.run_test(notifications=True) as pilot:
+            await pilot.pause(delay=1.0)
+
+    mock_tm.assert_not_called()
+    assert not any("pending" in str(n.message) for n in app._notifications)

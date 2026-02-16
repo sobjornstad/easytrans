@@ -3,7 +3,9 @@
     "allow": [
       "Bash(VBoxManage list:*)",
       "Bash(VBoxManage showvminfo:*)",
-      "Bash(VBoxManage:*)"
+      "Bash(VBoxManage:*)",
+      "Bash(source:*)",
+      "Bash(python -m pytest:*)"
     ]
   }
 }
