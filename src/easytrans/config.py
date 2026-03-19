@@ -25,6 +25,8 @@ audio_dir = "RECORDER/FOLDER_B"
 [whisper]
 # Model for initial fast transcription
 default_model = "tiny"
+# Model for automatic mid-quality upgrade
+mid_model = "small"
 # Model for re-transcription with higher quality
 large_model = "medium"
 """
@@ -40,6 +42,7 @@ class RecorderConfig:
 @dataclass
 class WhisperConfig:
     default_model: str = "tiny"
+    mid_model: str = "small"
     large_model: str = "medium"
 
 
@@ -95,6 +98,7 @@ def load_config(config_path: Path | None = None) -> EasyTransConfig:
         ),
         whisper=WhisperConfig(
             default_model=whisper.get("default_model", "tiny"),
+            mid_model=whisper.get("mid_model", "small"),
             large_model=whisper.get("large_model", "medium"),
         ),
     )

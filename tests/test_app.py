@@ -1138,16 +1138,16 @@ async def test_startup_transcribes_untranscribed_memos(tmp_path: Path) -> None:
     _add_memo_no_transcription(app.engine, tmp_path, "hash1", "2026-0001")
     _add_memo_no_transcription(app.engine, tmp_path, "hash2", "2026-0002")
 
-    transcribed_hashes = []
+    transcribed_calls = []
 
     def mock_transcribe(config, session, memo, **kwargs):
-        transcribed_hashes.append(memo.file_hash)
-        # Create a fake transcription
+        model = kwargs.get("model_name") or config.whisper.default_model
+        transcribed_calls.append((memo.file_hash, model))
         t = Transcription(
             memo_hash=memo.file_hash,
             transcribed_at=datetime(2026, 2, 16, 12, 0, tzinfo=timezone.utc),
-            model_name="tiny",
-            text="[00:00] Auto transcribed",
+            model_name=model,
+            text=f"[00:00] Auto transcribed with {model}",
         )
         session.add(t)
         session.flush()
@@ -1157,14 +1157,19 @@ async def test_startup_transcribes_untranscribed_memos(tmp_path: Path) -> None:
 
     with patch("easytrans.app.transcribe_memo", side_effect=mock_transcribe):
         async with app.run_test() as pilot:
-            await pilot.pause(delay=2.0)
+            await pilot.pause(delay=3.0)
 
-    assert sorted(transcribed_hashes) == ["hash1", "hash2"]
+    # Tier 1 calls (default model)
+    tier1 = sorted(h for h, m in transcribed_calls if m == "tiny")
+    assert tier1 == ["hash1", "hash2"]
+    # Tier 2 calls (mid-model upgrade) should also happen
+    tier2 = sorted(h for h, m in transcribed_calls if m == "small")
+    assert tier2 == ["hash1", "hash2"]
 
 
 @pytest.mark.asyncio
 async def test_startup_skips_already_transcribed_memos(tmp_path: Path) -> None:
-    """On startup, memos that already have transcriptions are NOT re-transcribed."""
+    """On startup, memos that already have transcriptions are NOT re-transcribed at tier 1."""
     app = _make_app(tmp_path)
     # This one has a transcription
     _add_memo(app.engine, tmp_path, "hash1", "2026-0001", text="Already done")
@@ -1181,34 +1186,175 @@ async def test_startup_skips_already_transcribed_memos(tmp_path: Path) -> None:
     # This one does NOT have a transcription
     _add_memo_no_transcription(app.engine, tmp_path, "hash2", "2026-0002")
 
-    transcribed_hashes = []
+    transcribed_calls = []
 
     def mock_transcribe(config, session, memo, **kwargs):
-        transcribed_hashes.append(memo.file_hash)
+        transcribed_calls.append((memo.file_hash, kwargs.get("model_name")))
+        model = kwargs.get("model_name") or config.whisper.default_model
         t = Transcription(
             memo_hash=memo.file_hash,
             transcribed_at=datetime(2026, 2, 16, 12, 0, tzinfo=timezone.utc),
-            model_name="tiny",
-            text="[00:00] Newly transcribed",
+            model_name=model,
+            text=f"[00:00] Transcribed with {model}",
         )
         session.add(t)
         session.flush()
         md = text_path(config.data_dir, memo.file_id)
         md.parent.mkdir(parents=True, exist_ok=True)
-        md.write_text("Newly transcribed\n")
+        md.write_text(f"Transcribed with {model}\n")
 
     with patch("easytrans.app.transcribe_memo", side_effect=mock_transcribe):
         async with app.run_test() as pilot:
-            await pilot.pause(delay=2.0)
+            await pilot.pause(delay=3.0)
 
-    # Only hash2 should have been transcribed
-    assert transcribed_hashes == ["hash2"]
+    # Tier 1: only hash2 should have been transcribed with default model
+    tier1_calls = [(h, m) for h, m in transcribed_calls if m is None]
+    assert tier1_calls == [("hash2", None)]
+    # Tier 2 (mid-model): both should get upgraded
+    tier2_calls = [(h, m) for h, m in transcribed_calls if m == "small"]
+    assert sorted(h for h, _ in tier2_calls) == ["hash1", "hash2"]
 
 
 @pytest.mark.asyncio
 async def test_startup_no_notification_when_all_transcribed(tmp_path: Path) -> None:
-    """No notification if all memos already have transcriptions."""
+    """No notification if all memos already have transcriptions (including mid-model)."""
     app = _make_app(tmp_path)
+    _add_memo(app.engine, tmp_path, "hash1", "2026-0001", text="Done")
+    with Session(app.engine) as session:
+        t1 = Transcription(
+            memo_hash="hash1",
+            transcribed_at=datetime(2026, 1, 15, 13, 0, tzinfo=timezone.utc),
+            model_name="tiny",
+            text="[00:00] Done",
+        )
+        t2 = Transcription(
+            memo_hash="hash1",
+            transcribed_at=datetime(2026, 1, 15, 14, 0, tzinfo=timezone.utc),
+            model_name="small",
+            text="[00:00] Done upgraded",
+        )
+        session.add_all([t1, t2])
+        session.commit()
+
+    with patch("easytrans.app.transcribe_memo") as mock_tm:
+        async with app.run_test(notifications=True) as pilot:
+            await pilot.pause(delay=1.0)
+
+    mock_tm.assert_not_called()
+    assert not any("pending" in str(n.message) for n in app._notifications)
+
+
+# --- Mid-model upgrade tests ---
+
+
+@pytest.mark.asyncio
+async def test_startup_triggers_mid_model_upgrade_after_tier1(tmp_path: Path) -> None:
+    """After tier 1 completes on startup, tier 2 mid-model upgrade triggers."""
+    app = _make_app(tmp_path)
+    _add_memo_no_transcription(app.engine, tmp_path, "hash1", "2026-0001")
+
+    transcribed_calls = []
+
+    def mock_transcribe(config, session, memo, **kwargs):
+        model = kwargs.get("model_name") or config.whisper.default_model
+        transcribed_calls.append((memo.file_hash, model))
+        t = Transcription(
+            memo_hash=memo.file_hash,
+            transcribed_at=datetime(2026, 2, 16, 12, 0, tzinfo=timezone.utc),
+            model_name=model,
+            text=f"[00:00] Transcribed with {model}",
+        )
+        session.add(t)
+        session.flush()
+        md = text_path(config.data_dir, memo.file_id)
+        md.parent.mkdir(parents=True, exist_ok=True)
+        md.write_text(f"Transcribed with {model}\n")
+
+    with patch("easytrans.app.transcribe_memo", side_effect=mock_transcribe):
+        async with app.run_test() as pilot:
+            await pilot.pause(delay=3.0)
+
+    # Should have tier 1 (tiny) then tier 2 (small)
+    assert ("hash1", "tiny") in transcribed_calls
+    assert ("hash1", "small") in transcribed_calls
+
+
+@pytest.mark.asyncio
+async def test_startup_triggers_mid_model_upgrade_directly(tmp_path: Path) -> None:
+    """When no tier 1 work needed, mid-model upgrade triggers directly on startup."""
+    app = _make_app(tmp_path)
+    # Memo already has tier 1 transcription but not mid-model
+    _add_memo(app.engine, tmp_path, "hash1", "2026-0001", text="Already done")
+    with Session(app.engine) as session:
+        t = Transcription(
+            memo_hash="hash1",
+            transcribed_at=datetime(2026, 1, 15, 13, 0, tzinfo=timezone.utc),
+            model_name="tiny",
+            text="[00:00] Already done",
+        )
+        session.add(t)
+        session.commit()
+
+    transcribed_calls = []
+
+    def mock_transcribe(config, session, memo, **kwargs):
+        model = kwargs.get("model_name") or config.whisper.default_model
+        transcribed_calls.append((memo.file_hash, model))
+        t = Transcription(
+            memo_hash=memo.file_hash,
+            transcribed_at=datetime(2026, 2, 16, 12, 0, tzinfo=timezone.utc),
+            model_name=model,
+            text=f"[00:00] Transcribed with {model}",
+        )
+        session.add(t)
+        session.flush()
+        md = text_path(config.data_dir, memo.file_id)
+        md.parent.mkdir(parents=True, exist_ok=True)
+        md.write_text(f"Transcribed with {model}\n")
+
+    with patch("easytrans.app.transcribe_memo", side_effect=mock_transcribe):
+        async with app.run_test() as pilot:
+            await pilot.pause(delay=3.0)
+
+    # Should only have mid-model upgrade, no tier 1
+    assert transcribed_calls == [("hash1", "small")]
+
+
+@pytest.mark.asyncio
+async def test_mid_model_skips_already_upgraded(tmp_path: Path) -> None:
+    """Memos that already have mid-model transcription are not upgraded again."""
+    app = _make_app(tmp_path)
+    _add_memo(app.engine, tmp_path, "hash1", "2026-0001", text="Done")
+    with Session(app.engine) as session:
+        t1 = Transcription(
+            memo_hash="hash1",
+            transcribed_at=datetime(2026, 1, 15, 13, 0, tzinfo=timezone.utc),
+            model_name="tiny",
+            text="[00:00] Done",
+        )
+        t2 = Transcription(
+            memo_hash="hash1",
+            transcribed_at=datetime(2026, 1, 15, 14, 0, tzinfo=timezone.utc),
+            model_name="small",
+            text="[00:00] Done upgraded",
+        )
+        session.add_all([t1, t2])
+        session.commit()
+
+    with patch("easytrans.app.transcribe_memo") as mock_tm:
+        async with app.run_test() as pilot:
+            await pilot.pause(delay=2.0)
+
+    mock_tm.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_mid_model_skipped_when_same_as_default(tmp_path: Path) -> None:
+    """Mid-model upgrade is skipped when mid_model == default_model."""
+    app = _make_app(tmp_path)
+    # Override config so mid_model equals default_model
+    app.config.whisper.mid_model = "tiny"
+
     _add_memo(app.engine, tmp_path, "hash1", "2026-0001", text="Done")
     with Session(app.engine) as session:
         t = Transcription(
@@ -1221,8 +1367,7 @@ async def test_startup_no_notification_when_all_transcribed(tmp_path: Path) -> N
         session.commit()
 
     with patch("easytrans.app.transcribe_memo") as mock_tm:
-        async with app.run_test(notifications=True) as pilot:
-            await pilot.pause(delay=1.0)
+        async with app.run_test() as pilot:
+            await pilot.pause(delay=2.0)
 
     mock_tm.assert_not_called()
-    assert not any("pending" in str(n.message) for n in app._notifications)

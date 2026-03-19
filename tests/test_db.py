@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from easytrans.db import (
     get_memos,
+    get_memos_needing_upgrade,
     get_transcriptions,
     get_latest_transcription,
     get_untranscribed_memos,
@@ -185,4 +186,101 @@ def test_get_untranscribed_memos_ordered_by_file_id(db_session: Session) -> None
     db_session.flush()
 
     result = get_untranscribed_memos(db_session)
+    assert [m.file_id for m in result] == ["2026-0001", "2026-0002", "2026-0003"]
+
+
+# --- Tests for get_memos_needing_upgrade ---
+
+
+def _add_transcription(
+    db_session: Session,
+    memo_hash: str,
+    model_name: str,
+    hour: int = 13,
+) -> None:
+    """Helper to add a transcription with a given model."""
+    t = Transcription(
+        memo_hash=memo_hash,
+        transcribed_at=datetime(2026, 1, 15, hour, 0, tzinfo=timezone.utc),
+        model_name=model_name,
+        text=f"transcribed by {model_name}",
+    )
+    db_session.add(t)
+    db_session.flush()
+
+
+def test_upgrade_returns_memos_with_only_default_model(db_session: Session) -> None:
+    """Memos with only a 'tiny' transcription need upgrading."""
+    m1 = _make_memo("hash1", "2026-0001")
+    m2 = _make_memo("hash2", "2026-0002")
+    db_session.add_all([m1, m2])
+    db_session.flush()
+    _add_transcription(db_session, "hash1", "tiny")
+    _add_transcription(db_session, "hash2", "tiny")
+
+    result = get_memos_needing_upgrade(db_session, "small", "medium")
+    assert [m.file_hash for m in result] == ["hash1", "hash2"]
+
+
+def test_upgrade_excludes_memos_with_mid_model(db_session: Session) -> None:
+    """Memos already having a mid_model transcription are excluded."""
+    m1 = _make_memo("hash1", "2026-0001")
+    db_session.add(m1)
+    db_session.flush()
+    _add_transcription(db_session, "hash1", "tiny")
+    _add_transcription(db_session, "hash1", "small", hour=14)
+
+    result = get_memos_needing_upgrade(db_session, "small", "medium")
+    assert len(result) == 0
+
+
+def test_upgrade_excludes_memos_with_large_model(db_session: Session) -> None:
+    """Memos already having a large_model transcription are excluded."""
+    m1 = _make_memo("hash1", "2026-0001")
+    db_session.add(m1)
+    db_session.flush()
+    _add_transcription(db_session, "hash1", "tiny")
+    _add_transcription(db_session, "hash1", "medium", hour=14)
+
+    result = get_memos_needing_upgrade(db_session, "small", "medium")
+    assert len(result) == 0
+
+
+def test_upgrade_excludes_untranscribed_memos(db_session: Session) -> None:
+    """Memos with no transcriptions at all (tier 1 not done) are excluded."""
+    m1 = _make_memo("hash1", "2026-0001")
+    db_session.add(m1)
+    db_session.flush()
+
+    result = get_memos_needing_upgrade(db_session, "small", "medium")
+    assert len(result) == 0
+
+
+def test_upgrade_empty_when_all_upgraded(db_session: Session) -> None:
+    """Returns empty list when all memos already have mid or large model."""
+    m1 = _make_memo("hash1", "2026-0001")
+    m2 = _make_memo("hash2", "2026-0002")
+    db_session.add_all([m1, m2])
+    db_session.flush()
+    _add_transcription(db_session, "hash1", "tiny")
+    _add_transcription(db_session, "hash1", "small", hour=14)
+    _add_transcription(db_session, "hash2", "tiny")
+    _add_transcription(db_session, "hash2", "medium", hour=14)
+
+    result = get_memos_needing_upgrade(db_session, "small", "medium")
+    assert len(result) == 0
+
+
+def test_upgrade_ordered_by_file_id(db_session: Session) -> None:
+    """Results are ordered by file_id."""
+    m1 = _make_memo("hash1", "2026-0003")
+    m2 = _make_memo("hash2", "2026-0001")
+    m3 = _make_memo("hash3", "2026-0002")
+    db_session.add_all([m1, m2, m3])
+    db_session.flush()
+    _add_transcription(db_session, "hash1", "tiny")
+    _add_transcription(db_session, "hash2", "tiny")
+    _add_transcription(db_session, "hash3", "tiny")
+
+    result = get_memos_needing_upgrade(db_session, "small", "medium")
     assert [m.file_id for m in result] == ["2026-0001", "2026-0002", "2026-0003"]

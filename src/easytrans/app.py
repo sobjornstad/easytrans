@@ -21,7 +21,7 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Static
 
 from easytrans.config import EasyTransConfig, load_config
-from easytrans.db import get_engine, get_memos, get_latest_transcription, get_untranscribed_memos
+from easytrans.db import get_engine, get_memos, get_latest_transcription, get_memos_needing_upgrade, get_untranscribed_memos
 from easytrans.files import find_source_audio, text_path
 from easytrans.models import Memo
 from easytrans.sync import (
@@ -604,6 +604,7 @@ class EasyTransApp(App):
         with Session(self.engine) as session:
             pending = get_untranscribed_memos(session)
             if not pending:
+                self._start_mid_model_upgrade()
                 return
             # Detach memos from session so the worker can use them
             for m in pending:
@@ -626,6 +627,50 @@ class EasyTransApp(App):
                     )
                     transcribe_memo(
                         self.config, session, memo,
+                        active_processes=self._active_processes,
+                    )
+                    session.commit()
+                    self.call_from_thread(self._update_memo_row, memo)
+                except Exception as e:
+                    if self._shutting_down.is_set():
+                        return
+                    self.call_from_thread(
+                        self._update_row_cell,
+                        memo.file_hash, 4, f"(error: {e})",
+                    )
+        self.call_from_thread(self._start_mid_model_upgrade)
+
+    def _start_mid_model_upgrade(self) -> None:
+        """Check for memos needing mid-model upgrade and kick it off."""
+        mid_model = self.config.whisper.mid_model
+        large_model = self.config.whisper.large_model
+        if mid_model == self.config.whisper.default_model:
+            return
+        with Session(self.engine) as session:
+            pending = get_memos_needing_upgrade(session, mid_model, large_model)
+            if not pending:
+                return
+            for m in pending:
+                session.expunge(m)
+        self.notify(f"Upgrading {len(pending)} memo(s) to {mid_model}...")
+        self._do_mid_model_upgrade(pending)
+
+    @work(thread=True, exclusive=True, group="upgrade")
+    def _do_mid_model_upgrade(self, memos: list[Memo]) -> None:
+        """Background worker to re-transcribe memos with the mid-quality model."""
+        mid_model = self.config.whisper.mid_model
+        with Session(self.engine) as session:
+            for memo in memos:
+                if self._shutting_down.is_set():
+                    return
+                try:
+                    self.call_from_thread(
+                        self._update_row_cell,
+                        memo.file_hash, 4, "(upgrading...)",
+                    )
+                    transcribe_memo(
+                        self.config, session, memo,
+                        model_name=mid_model, overwrite_md=True,
                         active_processes=self._active_processes,
                     )
                     session.commit()
@@ -1120,6 +1165,7 @@ class EasyTransApp(App):
             self.call_from_thread(self._refresh_table)
 
             if not new_memos:
+                self.call_from_thread(self._start_mid_model_upgrade)
                 return
 
             # Transcribe each memo, updating table rows as each completes
@@ -1146,6 +1192,7 @@ class EasyTransApp(App):
                         self._update_row_cell,
                         memo.file_hash, 4, f"(error: {e})",
                     )
+            self.call_from_thread(self._start_mid_model_upgrade)
 
     def _update_row_cell(self, row_key_value: str, col_idx: int, value: str) -> None:
         """Update a single cell in the table by row key and column index."""

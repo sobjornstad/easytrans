@@ -84,6 +84,33 @@ def get_untranscribed_memos(session: Session) -> list[Memo]:
     return list(session.scalars(stmt).all())
 
 
+def get_memos_needing_upgrade(
+    session: Session, mid_model: str, large_model: str,
+) -> list[Memo]:
+    """Get memos that have a transcription but none with mid_model or large_model.
+
+    Returns memos where tier 1 is done (at least one transcription exists)
+    but no transcription uses mid_model or large_model yet, ordered by file_id.
+    """
+    has_transcription = exists(
+        select(Transcription.id).where(
+            Transcription.memo_hash == Memo.file_hash
+        )
+    )
+    has_upgrade = exists(
+        select(Transcription.id).where(
+            Transcription.memo_hash == Memo.file_hash,
+            Transcription.model_name.in_([mid_model, large_model]),
+        )
+    )
+    stmt = (
+        select(Memo)
+        .where(has_transcription, ~has_upgrade)
+        .order_by(Memo.file_id)
+    )
+    return list(session.scalars(stmt).all())
+
+
 def get_latest_transcription(session: Session, memo_hash: str) -> Transcription | None:
     """Get the most recent transcription for a memo."""
     stmt = (
