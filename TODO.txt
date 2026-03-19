@@ -1,0 +1,44 @@
+Bugs:
+
+- [ ] The preview pane scrolls up to the top again whenever a background transcription finishes
+- [ ] An ID typed into go without a year still tries to select an earlier year even if it’s not on the page I think? Not sure, there was something weird about this navigation
+
+
+Polish/refactor:
+
+- [ ]
+
+
+New features (likely):
+
+
+New features (distant backlog):
+
+- [ ] Integrations
+    - [ ] rtappend
+    - [ ] afui
+    - [ ] email
+    - [ ] dr
+    - [ ] M2 entry
+
+- [ ] Play by highlight timestamp?
+    - Ideally you can do this in the editor as well as in the app.
+    - It would be nice if play didn’t foreground mplayer so you can’t use the app
+
+
+
+
+
+
+
+
+
+
+------
+
+graves:
+
+Let's change a couple of keybindings:
+
+* copy -> y (for yank); use label "Copy Text"
+* copy with timestamps -> Y; use label "Copy Text with Timestamps"

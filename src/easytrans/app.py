@@ -1240,7 +1240,7 @@ class EasyTransApp(App):
 
         # Immediately update Model and Preview columns to show progress
         self._update_row_cell(memo.file_hash, 3, model)  # Model column
-        self._update_row_cell(memo.file_hash, 4, "(transcribing...)")  # Preview column
+        self._update_row_cell(memo.file_hash, 4, "(upgrading...)")  # Preview column
 
         self._retranscribe_worker = self._do_retranscribe(memo, model)
 

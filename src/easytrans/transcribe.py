@@ -1,6 +1,7 @@
 """Audio conversion and Whisper transcription for EasyTrans."""
 
 import multiprocessing
+import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -34,6 +35,10 @@ def convert_to_wav(source: Path, dest: Path) -> None:
 
 def _whisper_worker(wav_file: str, model_name: str, result_queue: multiprocessing.Queue) -> None:
     """Run Whisper transcription in a child process."""
+    # Prevent CTranslate2/CUDA from probing the GPU — can crash the NVIDIA driver
+    # when the GPU is under load from the display server.
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
     from faster_whisper import WhisperModel
 
     model = WhisperModel(model_name, device="cpu", compute_type="int8")

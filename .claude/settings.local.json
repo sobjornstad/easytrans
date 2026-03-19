@@ -5,7 +5,9 @@
       "Bash(VBoxManage showvminfo:*)",
       "Bash(VBoxManage:*)",
       "Bash(source:*)",
-      "Bash(python -m pytest:*)"
+      "Bash(python -m pytest:*)",
+      "WebSearch",
+      "Bash(grep:*)",
     ]
   }
 }
