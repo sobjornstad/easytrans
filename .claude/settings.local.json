@@ -35,7 +35,9 @@
       "Read(//home/soren/.local/share/**)",
       "Read(//home/soren/.local/cl/easytrans/**)",
       "Bash(ls *.md *.txt)",
-      "Bash(jj status *)"
+      "Bash(jj status *)",
+      "Bash(/home/soren/.claude/skills/tmux-tui/scripts/tui.sh restart *)",
+      "Bash(/home/soren/.claude/skills/tmux-tui/scripts/tui.sh resize *)"
     ]
   }
 }

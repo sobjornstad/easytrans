@@ -61,7 +61,17 @@ _CELL_PAD_RENDER = 2                # 2 * cell_padding for preview column
 
 
 class MemoPreview(VerticalScroll):
-    """Scrollable preview pane showing the selected memo's transcription text."""
+    """Scrollable preview pane showing the selected memo's transcription text.
+
+    Supports two display modes:
+      - plain: a single `#preview-text` Static holding the full content (used
+        for the normal selection preview and for the non-playback timestamped
+        view).
+      - segmented: one Static per playback segment, mounted as separate
+        children. This lets Textual handle per-segment layout and wrapping, so
+        `scroll_to_widget` can reliably keep the current segment visible even
+        when segments wrap to multiple visual lines.
+    """
 
     DEFAULT_CSS = """
     MemoPreview {
@@ -74,6 +84,20 @@ class MemoPreview(VerticalScroll):
     #preview-text {
         padding: 1 2;
     }
+    .segment-line {
+        padding: 0 2;
+    }
+    /* Re-specify the full padding shorthand here: Textual's partial-edge
+       handlers (padding-top / padding-bottom) only see the rule they're
+       declared in, so writing just `padding-top: 1` would cascade as
+       `padding: (1,0,0,0)` and clobber the left/right padding from the
+       base .segment-line rule. */
+    .segment-line.-first {
+        padding: 1 2 0 2;
+    }
+    .segment-line.-last {
+        padding: 0 2 1 2;
+    }
     """
 
     BINDINGS = [
@@ -85,12 +109,69 @@ class MemoPreview(VerticalScroll):
         Binding("ctrl+b, pageup", "page_up", "Page Up", show=False),
     ]
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._segment_statics: list[Static] = []
+        self._segment_texts: list[str] = []
+        self._segments_key: object = None
+
     def compose(self) -> ComposeResult:
         yield Static(id="preview-text")
 
     def update(self, content) -> None:
-        """Update the preview text content (str or Rich renderable)."""
-        self.query_one("#preview-text", Static).update(content)
+        """Show `content` as a single block. Leaves segmented mode if active."""
+        if self._segments_key is not None:
+            self._tear_down_segments()
+        default = self.query_one("#preview-text", Static)
+        default.display = True
+        default.update(content)
+
+    def show_segments(
+        self,
+        lines: list[str],
+        current_idx: int,
+        key: object,
+    ) -> None:
+        """Show one Static per segment line. `key` identifies the segment set;
+        if it's unchanged from the last call, the mounted widgets are reused
+        and only the highlight is updated."""
+        if key != self._segments_key:
+            self._tear_down_segments()
+            self.query_one("#preview-text", Static).display = False
+            self._segment_texts = list(lines)
+            new_statics: list[Static] = []
+            n = len(self._segment_texts)
+            for i, text in enumerate(self._segment_texts):
+                classes = ["segment-line"]
+                if i == 0:
+                    classes.append("-first")
+                if i == n - 1:
+                    classes.append("-last")
+                s = Static(Text(text), classes=" ".join(classes))
+                new_statics.append(s)
+            if new_statics:
+                self.mount_all(new_statics)
+            self._segment_statics = new_statics
+            self._segments_key = key
+        self._highlight_segment(current_idx)
+
+    def _highlight_segment(self, idx: int) -> None:
+        for i, s in enumerate(self._segment_statics):
+            line = self._segment_texts[i]
+            if i == idx:
+                s.update(Text(line, style="reverse"))
+            else:
+                s.update(Text(line))
+        if 0 <= idx < len(self._segment_statics):
+            target = self._segment_statics[idx]
+            self.call_after_refresh(self.scroll_to_widget, target, animate=False)
+
+    def _tear_down_segments(self) -> None:
+        for s in self._segment_statics:
+            s.remove()
+        self._segment_statics = []
+        self._segment_texts = []
+        self._segments_key = None
 
     def action_preview_half_page_down(self) -> None:
         amount = max(1, self.scrollable_content_region.height // 2)
@@ -1320,34 +1401,16 @@ class EasyTransApp(App):
             self._refresh_preview_content()
             return
 
-        text = Text()
-        for i, seg in enumerate(self._playback_segments):
-            line = f"[{format_timestamp(seg.start)}] {seg.text}"
-            if i == self._playback_segment_idx:
-                text.append(line, style="reverse")
-            else:
-                text.append(line)
-            if i < len(self._playback_segments) - 1:
-                text.append("\n")
-
+        lines = [
+            f"[{format_timestamp(seg.start)}] {seg.text}"
+            for seg in self._playback_segments
+        ]
         preview = self.query_one("#preview", MemoPreview)
-        preview.update(text)
-        self._scroll_preview_to_current_segment()
-
-    def _scroll_preview_to_current_segment(self) -> None:
-        if not self._playback_segments:
-            return
-        try:
-            preview = self.query_one("#preview", MemoPreview)
-        except Exception:
-            return
-        y = self._playback_segment_idx
-        top = preview.scroll_offset.y
-        height = preview.scrollable_content_region.height
-        if height <= 0:
-            return
-        if y < top or y >= top + height:
-            preview.scroll_to(y=max(0, y - height // 3), animate=False)
+        preview.show_segments(
+            lines,
+            self._playback_segment_idx,
+            key=self._playback_memo_hash,
+        )
 
     def action_toggle_timestamps(self) -> None:
         """Toggle timestamp display in preview pane."""

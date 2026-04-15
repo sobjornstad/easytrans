@@ -2063,12 +2063,25 @@ async def test_highlight_renders_in_preview(tmp_path: Path) -> None:
     async with app.run_test() as pilot:
         await pilot.press("p")
         await pilot.pause()
-        preview_text = app.query_one("#preview-text", Static)
+
+        preview = app.query_one("#preview", MemoPreview)
+        segment_widgets = list(preview.query(".segment-line"))
+        assert len(segment_widgets) == 3
+
         from rich.text import Text as RichText
-        content = preview_text.content
-        assert isinstance(content, RichText)
-        assert "First line" in content.plain
-        assert "Second line" in content.plain
-        assert "Third line" in content.plain
-        styles = [str(span.style) for span in content.spans]
-        assert any("reverse" in s for s in styles)
+        lines = []
+        styles = []
+        for s in segment_widgets:
+            content = s.content
+            assert isinstance(content, RichText)
+            lines.append(content.plain)
+            styles.append(str(content.style))
+
+        joined = "\n".join(lines)
+        assert "First line" in joined
+        assert "Second line" in joined
+        assert "Third line" in joined
+        # The currently-playing segment (idx 0) renders with reverse style.
+        assert "reverse" in styles[0]
+        assert "reverse" not in styles[1]
+        assert "reverse" not in styles[2]
