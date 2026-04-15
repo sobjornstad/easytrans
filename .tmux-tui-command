@@ -1,1 +1,1 @@
-source /home/vagrant/.venvs/easytrans/bin/activate && python -m easytrans
+uv run easytrans
