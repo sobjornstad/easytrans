@@ -7,7 +7,7 @@
       "Bash(source:*)",
       "Bash(python -m pytest:*)",
       "WebSearch",
-      "Bash(grep:*)",
+      "Bash(grep:*)"
     ]
   }
 }
