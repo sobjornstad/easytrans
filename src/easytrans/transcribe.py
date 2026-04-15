@@ -3,16 +3,13 @@
 import multiprocessing
 import os
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
 
-from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from easytrans.config import EasyTransConfig
-from easytrans.files import audio_path, text_path, wav_path
+from easytrans.files import text_path, wav_path
 from easytrans.models import Memo, Transcription
 
 
@@ -33,15 +30,32 @@ def convert_to_wav(source: Path, dest: Path) -> None:
     )
 
 
-def _whisper_worker(wav_file: str, model_name: str, result_queue: multiprocessing.Queue) -> None:
+def _whisper_worker(
+    wav_file: str,
+    model_name: str,
+    cpu_threads: int,
+    result_queue: multiprocessing.Queue,
+) -> None:
     """Run Whisper transcription in a child process."""
-    # Prevent CTranslate2/CUDA from probing the GPU — can crash the NVIDIA driver
-    # when the GPU is under load from the display server.
+    # Keep the GPU out of it: previous investigation blamed CUDA, but the real
+    # failure mode is sustained all-core CPU AVX2 load hard-locking the box.
+    # Both need to be constrained — see the "Known hardware issue" note in SPEC.md.
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    # These must be set BEFORE faster_whisper/ctranslate2 is imported, since
+    # OpenMP reads the thread count once at runtime init.
+    os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
+    os.environ["OMP_DYNAMIC"] = "FALSE"
+    os.environ["MKL_NUM_THREADS"] = str(cpu_threads)
 
     from faster_whisper import WhisperModel
 
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    model = WhisperModel(
+        model_name,
+        device="cpu",
+        compute_type="int8",
+        cpu_threads=cpu_threads,
+        num_workers=1,
+    )
     segments, _info = model.transcribe(wav_file, beam_size=1)
 
     result = []
@@ -57,6 +71,7 @@ def _whisper_worker(wav_file: str, model_name: str, result_queue: multiprocessin
 def transcribe_audio(
     wav_file: Path,
     model_name: str,
+    cpu_threads: int,
     active_processes: set | None = None,
 ) -> list[dict]:
     """Transcribe a WAV file using faster-whisper in a child process.
@@ -65,10 +80,10 @@ def transcribe_audio(
     If active_processes is provided, the process is registered there
     while running so callers can kill it.
     """
-    q = multiprocessing.Queue()
+    q: multiprocessing.Queue = multiprocessing.Queue()
     p = multiprocessing.Process(
         target=_whisper_worker,
-        args=(str(wav_file), model_name, q),
+        args=(str(wav_file), model_name, cpu_threads, q),
     )
     if active_processes is not None:
         active_processes.add(p)
@@ -138,7 +153,12 @@ def transcribe_memo(
         convert_to_wav(source, wav)
 
     # Transcribe
-    segments = transcribe_audio(wav, model_name, active_processes=active_processes)
+    segments = transcribe_audio(
+        wav,
+        model_name,
+        cpu_threads=config.whisper.cpu_threads,
+        active_processes=active_processes,
+    )
 
     # Store timestamped text in DB
     timestamped_text = segments_to_text(segments, include_timestamps=True)
@@ -159,34 +179,3 @@ def transcribe_memo(
         md.write_text(clean_text + "\n")
 
     return transcription
-
-
-def transcribe_memos_parallel(
-    config: EasyTransConfig,
-    engine: Engine,
-    memos: list[Memo],
-    model_name: str | None = None,
-    on_complete: Callable[[Memo], None] | None = None,
-) -> list[Transcription]:
-    """Transcribe multiple memos in parallel using a thread pool.
-
-    Each thread gets its own DB session. Calls on_complete callback
-    after each memo finishes (for UI progress updates).
-    """
-    results: list[Transcription] = []
-
-    def _process(memo: Memo) -> Transcription:
-        with Session(engine) as session:
-            t = transcribe_memo(config, session, memo, model_name)
-            session.commit()
-            if on_complete:
-                on_complete(memo)
-            return t
-
-    # Use 2 workers to avoid overwhelming CPU on a small machine
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(_process, m) for m in memos]
-        for future in futures:
-            results.append(future.result())
-
-    return results

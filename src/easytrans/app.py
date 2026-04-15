@@ -652,7 +652,10 @@ class EasyTransApp(App):
                 return
             for m in pending:
                 session.expunge(m)
-        self.notify(f"Upgrading {len(pending)} memo(s) to {mid_model}...")
+        self.notify(
+            f"Upgrading {len(pending)} memo(s) to {mid_model} "
+            f"({self.config.whisper.cpu_threads} CPU threads)..."
+        )
         self._do_mid_model_upgrade(pending)
 
     @work(thread=True, exclusive=True, group="upgrade")

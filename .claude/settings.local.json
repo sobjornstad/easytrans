@@ -7,7 +7,19 @@
       "Bash(source:*)",
       "Bash(python -m pytest:*)",
       "WebSearch",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(journalctl --list-boots)",
+      "Bash(journalctl -b -1 -k --no-pager)",
+      "Bash(journalctl -b -1 --no-pager -p err)",
+      "Bash(sensors)",
+      "Read(//sys/devices/system/cpu/cpufreq/policy0/**)",
+      "Read(//var/log/**)",
+      "Bash(dmesg)",
+      "Bash(journalctl -b 0 --no-pager)",
+      "Read(//sys/class/powercap/**)",
+      "Read(//sys/devices/virtual/powercap/intel-rapl/intel-rapl:0/**)",
+      "Read(//sys/devices/system/cpu/intel_pstate/**)",
+      "Bash(uv run *)"
     ]
   }
 }

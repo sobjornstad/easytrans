@@ -29,6 +29,12 @@ default_model = "tiny"
 mid_model = "small"
 # Model for re-transcription with higher quality
 large_model = "medium"
+# Maximum CPU threads per Whisper inference process.
+# Keep this well below the number of cores to avoid overloading the machine:
+# sustained all-core AVX2 load from CTranslate2 has been observed to hard-lock
+# this system (see the "Known hardware issue" note in SPEC.md). Do not set to 0
+# (which would mean "use all cores").
+cpu_threads = 4
 """
 
 
@@ -44,6 +50,7 @@ class WhisperConfig:
     default_model: str = "tiny"
     mid_model: str = "small"
     large_model: str = "medium"
+    cpu_threads: int = 4
 
 
 @dataclass
@@ -100,5 +107,6 @@ def load_config(config_path: Path | None = None) -> EasyTransConfig:
             default_model=whisper.get("default_model", "tiny"),
             mid_model=whisper.get("mid_model", "small"),
             large_model=whisper.get("large_model", "medium"),
+            cpu_threads=whisper.get("cpu_threads", 4),
         ),
     )

@@ -116,3 +116,32 @@ We’ll write the app in Python using a modern dev stack:
 * sqlite with SQLAlchemy
 * Textual
 
+
+## Known hardware issue: Whisper CPU load can hard-lock this machine
+
+The dev box (i9-10900K on an ASUS Z490 board, ASUS "MultiCore Enhancement" /
+unlimited RAPL power limits in BIOS) has been observed to hard-lock — total
+freeze, no SSH, no kernel log, audible "tick" from the speakers as the DAC loses
+state — during sustained all-core AVX2 load from `faster-whisper` /
+`ctranslate2`. The post-crash reboot surfaces an ACPI BERT hardware-error record
+(`journalctl -b 0 -k | grep -i bert`), confirming the fault is at the firmware /
+power-delivery layer, not a software bug in EasyTrans.
+
+This was originally misdiagnosed as a CUDA/NVIDIA driver issue. Disabling CUDA
+helped (removing one power consumer) but did not fix it, because the root cause
+is CPU-side: CTranslate2 defaults to one OpenMP thread per logical core and
+pegs every core at all-core turbo drawing 200+ W, which exceeds the combined
+cooling / VRM / PSU headroom on this box.
+
+**The code deliberately caps Whisper threads.** `whisper.cpu_threads` in
+`config.toml` (default 4 on a 10C/20T CPU) is passed through to
+`WhisperModel(cpu_threads=...)` and mirrored into `OMP_NUM_THREADS` /
+`MKL_NUM_THREADS` in the worker process before `faster_whisper` is imported.
+**Do not set this to 0 ("all cores") and do not raise it much without testing
+for sustained stability first.** If the crash ever recurs after this cap is in
+place, drop it to 2 or 1 before looking for software causes.
+
+The *real* fix is BIOS-level — set PL1 = 125 W / PL2 = 250 W / Tau = 56 s
+(Intel 10900K spec), disable "Remove all power limits", apply a modest
+(−50 mV-ish) CPU undervolt, and confirm cooler mount and case airflow. Once
+that is done, the software cap can be raised.

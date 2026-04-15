@@ -2,7 +2,9 @@
 
 import multiprocessing
 import os
+from pathlib import Path
 
+from easytrans.config import load_config
 from easytrans.transcribe import format_timestamp, segments_to_text
 
 
@@ -34,8 +36,25 @@ def test_segments_to_text_empty() -> None:
     assert segments_to_text([], include_timestamps=True) == ""
 
 
-def _cuda_check_worker(result_queue: multiprocessing.Queue) -> None:
-    """Helper that runs in a child process to check CUDA env inside _whisper_worker."""
+def test_config_cpu_threads_default(tmp_path: Path) -> None:
+    config = load_config(tmp_path / "config.toml")
+    assert config.whisper.cpu_threads == 4
+
+
+def test_config_cpu_threads_roundtrip(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        'data_dir = "~/x"\n'
+        "[whisper]\n"
+        "cpu_threads = 2\n"
+    )
+    config = load_config(cfg_path)
+    assert config.whisper.cpu_threads == 2
+
+
+def _env_check_worker(result_queue: multiprocessing.Queue) -> None:
+    """Helper that runs in a child process to snapshot env vars at the moment
+    `_whisper_worker` tries to import `faster_whisper`."""
     import unittest.mock
 
     captured: dict[str, str | None] = {}
@@ -44,8 +63,8 @@ def _cuda_check_worker(result_queue: multiprocessing.Queue) -> None:
 
     def mock_import(name, *args, **kwargs):
         if name == "faster_whisper":
-            # Capture the env var at the moment faster_whisper would be imported
-            captured["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES")
+            for key in ("CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+                captured[key] = os.environ.get(key)
             raise ImportError("mock: stop here")
         return original_import(name, *args, **kwargs)
 
@@ -53,24 +72,37 @@ def _cuda_check_worker(result_queue: multiprocessing.Queue) -> None:
         from easytrans.transcribe import _whisper_worker
         q: multiprocessing.Queue = multiprocessing.Queue()
         try:
-            _whisper_worker("dummy.wav", "tiny", q)
+            _whisper_worker("dummy.wav", "tiny", 3, q)
         except ImportError:
             pass
 
-    result_queue.put(captured.get("CUDA_VISIBLE_DEVICES"))
+    result_queue.put(captured)
 
 
-def test_cuda_disabled_before_whisper_import() -> None:
-    """Regression: CUDA_VISIBLE_DEVICES must be set before importing faster_whisper.
+def test_env_vars_set_before_whisper_import() -> None:
+    """Regression: CUDA_VISIBLE_DEVICES and thread caps must be set BEFORE
+    faster_whisper is imported.
 
-    CTranslate2 probes the GPU at import time; on a loaded display GPU this can
-    crash the NVIDIA driver. See commit history for details.
+    - CUDA_VISIBLE_DEVICES: CTranslate2 probes the GPU at import time; on a
+      loaded display GPU this can crash the NVIDIA driver.
+    - OMP_NUM_THREADS / MKL_NUM_THREADS: OpenMP reads the thread count once at
+      runtime init, and sustained all-core AVX2 load has been observed to
+      hard-lock the dev machine (see SPEC.md "Known hardware issue").
     """
     q: multiprocessing.Queue = multiprocessing.Queue()
-    p = multiprocessing.Process(target=_cuda_check_worker, args=(q,))
+    p = multiprocessing.Process(target=_env_check_worker, args=(q,))
     p.start()
     p.join(timeout=10)
-    value = q.get_nowait()
-    assert value == "", (
-        f"CUDA_VISIBLE_DEVICES should be '' before faster_whisper import, got {value!r}"
+    captured = q.get_nowait()
+    assert captured["CUDA_VISIBLE_DEVICES"] == "", (
+        f"CUDA_VISIBLE_DEVICES should be '' before faster_whisper import, got "
+        f"{captured['CUDA_VISIBLE_DEVICES']!r}"
+    )
+    assert captured["OMP_NUM_THREADS"] == "3", (
+        f"OMP_NUM_THREADS should be '3' (matching cpu_threads) before faster_whisper "
+        f"import, got {captured['OMP_NUM_THREADS']!r}"
+    )
+    assert captured["MKL_NUM_THREADS"] == "3", (
+        f"MKL_NUM_THREADS should be '3' before faster_whisper import, got "
+        f"{captured['MKL_NUM_THREADS']!r}"
     )
