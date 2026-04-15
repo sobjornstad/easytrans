@@ -1,13 +1,13 @@
 """Textual TUI application for EasyTrans."""
 
 import os
-import signal
 import subprocess
 import threading
 import time
 from pathlib import Path
 
 from rich.style import Style as RichStyle
+from rich.text import Text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 from textual import work
@@ -24,6 +24,13 @@ from easytrans.config import EasyTransConfig, load_config
 from easytrans.db import get_engine, get_memos, get_latest_transcription, get_memos_needing_upgrade, get_untranscribed_memos
 from easytrans.files import find_source_audio, text_path
 from easytrans.models import Memo
+from easytrans.playback import (
+    AudioPlayer,
+    MpvAudioPlayer,
+    Segment,
+    find_segment_index,
+    parse_segments,
+)
 from easytrans.sync import (
     copy_single_file,
     find_new_files,
@@ -31,7 +38,7 @@ from easytrans.sync import (
     scan_recorder,
     unmount_recorder,
 )
-from easytrans.transcribe import transcribe_memo
+from easytrans.transcribe import format_timestamp, transcribe_memo
 
 # Status indicators
 CIRCLE_OPEN = "\u25cb"    # ○
@@ -77,8 +84,8 @@ class MemoPreview(VerticalScroll):
     def compose(self) -> ComposeResult:
         yield Static(id="preview-text")
 
-    def update(self, content: str) -> None:
-        """Update the preview text content."""
+    def update(self, content) -> None:
+        """Update the preview text content (str or Rich renderable)."""
         self.query_one("#preview-text", Static).update(content)
 
     def action_preview_half_page_down(self) -> None:
@@ -88,6 +95,43 @@ class MemoPreview(VerticalScroll):
     def action_preview_half_page_up(self) -> None:
         amount = max(1, self.scrollable_content_region.height // 2)
         self.scroll_relative(y=-amount, animate=False)
+
+    def on_key(self, event: Key) -> None:
+        # Any non-playback-control key while playing stops playback,
+        # then continues with normal handling.
+        app = self.app
+        if getattr(app, "_player", None) is not None:
+            if event.key not in _PLAYBACK_CONTROL_KEYS:
+                app._stop_playback()
+
+
+class PlaybackStatus(Static):
+    """Status bar shown while audio is playing."""
+
+    DEFAULT_CSS = """
+    PlaybackStatus {
+        height: 1;
+        background: $primary;
+        color: $text;
+        display: none;
+        padding: 0 1;
+    }
+    PlaybackStatus.visible {
+        display: block;
+    }
+    """
+
+
+# Keys that should NOT stop playback when pressed during playback.
+# `p` toggles stop via the binding; <,>,up,down are handled by app
+# priority bindings that fire only while playing.
+_PLAYBACK_CONTROL_KEYS = frozenset({
+    "p",
+    "less_than_sign",
+    "greater_than_sign",
+    "up",
+    "down",
+})
 
 
 class GotoStatus(Static):
@@ -241,6 +285,13 @@ class MemoTable(DataTable):
     # --- Key handling ---
 
     def on_key(self, event: Key) -> None:
+        # Any non-playback-control key while playing stops playback,
+        # then continues with normal handling so the key still navigates.
+        app = self.app
+        if getattr(app, "_player", None) is not None:
+            if event.key not in _PLAYBACK_CONTROL_KEYS:
+                app._stop_playback()
+
         # gg handling — must come first
         if event.character == "g":
             if self._g_pending:
@@ -557,7 +608,18 @@ class EasyTransApp(App):
         Binding("h", "toggle_completed", "Hide/Show done"),
         Binding("e", "edit", "Edit"),
         Binding("r", "retranscribe", "Re-transcribe"),
-        Binding("p", "play", "Play"),
+        Binding("p", "play_start", "Play", id="play_start"),
+        Binding("p", "play_stop", "Stop Playing", id="play_stop"),
+        Binding("less_than_sign", "seek_back", "<5s", id="seek_back"),
+        Binding("greater_than_sign", "seek_forward", ">5s", id="seek_forward"),
+        Binding(
+            "up", "playback_prev_line", "Prev Line",
+            id="playback_prev", priority=True, show=False,
+        ),
+        Binding(
+            "down", "playback_next_line", "Next Line",
+            id="playback_next", priority=True, show=False,
+        ),
         Binding("t", "toggle_timestamps", "Timestamps"),
         Binding("c", "copy_text", "Copy"),
         Binding("shift+c", "copy_timestamps", "Copy+timestamps"),
@@ -582,6 +644,14 @@ class EasyTransApp(App):
         self._active_processes: set = set()
         # Event signalling that the app is shutting down; checked by workers
         self._shutting_down = threading.Event()
+        # Audio playback state
+        self._player: AudioPlayer | None = None
+        self._playback_memo_hash: str | None = None
+        self._playback_memo_id: str | None = None
+        self._playback_segments: list[Segment] = []
+        self._playback_segment_idx: int = 0
+        self._playback_tick_timer = None
+        self._playback_saved_show_timestamps: bool = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -589,8 +659,29 @@ class EasyTransApp(App):
             yield MemoTable(id="memo-table")
             with Vertical(id="preview-area"):
                 yield MemoPreview(id="preview")
+                yield PlaybackStatus(id="playback-status")
                 yield GotoStatus(id="goto-status")
         yield Footer()
+
+    def _make_audio_player(self) -> AudioPlayer:
+        """Construct an AudioPlayer. Tests override this to inject a stub."""
+        return MpvAudioPlayer()
+
+    @property
+    def _is_playing(self) -> bool:
+        return self._player is not None
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        playing = self._is_playing
+        if action == "play_start":
+            return False if playing else True
+        if action == "play_stop":
+            return True if playing else False
+        if action in ("seek_back", "seek_forward"):
+            return True if playing else False
+        if action in ("playback_prev_line", "playback_next_line"):
+            return True if playing else False
+        return True
 
     def on_mount(self) -> None:
         table = self.query_one("#memo-table", MemoTable)
@@ -819,6 +910,14 @@ class EasyTransApp(App):
             preview.update("No memo selected")
             return
 
+        if (
+            self._is_playing
+            and self._playback_segments
+            and memo.file_hash == self._playback_memo_hash
+        ):
+            self._render_preview_with_highlight()
+            return
+
         parts = []
 
         # Show dates in preview when date columns are hidden
@@ -943,8 +1042,48 @@ class EasyTransApp(App):
             if row < table.row_count - 1:
                 table.move_cursor(row=row + 1)
 
-    def action_play(self) -> None:
-        """Play the selected memo's audio file."""
+    def action_play_start(self) -> None:
+        self._start_playback()
+
+    def action_play_stop(self) -> None:
+        self._stop_playback()
+
+    def action_seek_back(self) -> None:
+        if self._player is not None:
+            self._player.seek_relative(-5.0)
+            t = self._player.time_pos
+            if t is not None:
+                self._update_playback_status_text(t)
+
+    def action_seek_forward(self) -> None:
+        if self._player is not None:
+            self._player.seek_relative(5.0)
+            t = self._player.time_pos
+            if t is not None:
+                self._update_playback_status_text(t)
+
+    def action_playback_prev_line(self) -> None:
+        if not self._playback_segments:
+            return
+        if self._playback_segment_idx > 0:
+            self._jump_to_segment(self._playback_segment_idx - 1)
+
+    def action_playback_next_line(self) -> None:
+        if not self._playback_segments:
+            return
+        if self._playback_segment_idx + 1 < len(self._playback_segments):
+            self._jump_to_segment(self._playback_segment_idx + 1)
+
+    def _jump_to_segment(self, idx: int) -> None:
+        self._playback_segment_idx = idx
+        if self._player is not None:
+            self._player.seek_absolute(self._playback_segments[idx].start)
+            t = self._player.time_pos
+            if t is not None:
+                self._update_playback_status_text(t)
+        self._render_preview_with_highlight()
+
+    def _start_playback(self) -> None:
         memo = self._get_selected_memo()
         if memo is None:
             self.notify("No memo selected", severity="warning")
@@ -953,21 +1092,122 @@ class EasyTransApp(App):
         if src is None:
             self.notify("Audio file not found", severity="warning")
             return
-        # Try common audio players
-        for cmd in (["ffplay", "-nodisp", "-autoexit"], ["mpv", "--no-video"], ["aplay"]):
-            try:
-                with self.suspend():
-                    # Ignore SIGINT in the parent so Ctrl+C kills only the
-                    # audio player, not the Textual app.
-                    old_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
-                    try:
-                        subprocess.run(cmd + [str(src)])
-                    finally:
-                        signal.signal(signal.SIGINT, old_handler)
-                return
-            except FileNotFoundError:
-                continue
-        self.notify("No audio player found (install ffplay or mpv)", severity="warning")
+
+        segments: list[Segment] = []
+        with Session(self.engine) as session:
+            t = get_latest_transcription(session, memo.file_hash)
+            if t is not None:
+                segments = parse_segments(t.text)
+
+        try:
+            self._player = self._make_audio_player()
+            self._player.play(src)
+        except Exception as e:
+            self._player = None
+            self.notify(f"Playback failed: {e}", severity="error")
+            return
+
+        self._playback_memo_hash = memo.file_hash
+        self._playback_memo_id = memo.file_id
+        self._playback_segments = segments
+        self._playback_segment_idx = 0
+
+        if segments:
+            self._playback_saved_show_timestamps = self.show_timestamps
+            self.show_timestamps = True
+
+        status = self.query_one("#playback-status", PlaybackStatus)
+        status.add_class("visible")
+        self._update_playback_status_text(0.0)
+
+        self._playback_tick_timer = self.set_interval(0.25, self._on_playback_tick)
+
+        self.refresh_bindings()
+        self._render_preview_with_highlight()
+
+    def _stop_playback(self) -> None:
+        if self._player is None:
+            return
+
+        try:
+            self._player.stop()
+        except Exception:
+            pass
+        self._player = None
+
+        if self._playback_tick_timer is not None:
+            self._playback_tick_timer.stop()
+            self._playback_tick_timer = None
+
+        try:
+            status = self.query_one("#playback-status", PlaybackStatus)
+            status.remove_class("visible")
+            status.update("")
+        except Exception:
+            pass
+
+        had_segments = bool(self._playback_segments)
+        if had_segments:
+            self.show_timestamps = self._playback_saved_show_timestamps
+
+        self._playback_memo_hash = None
+        self._playback_memo_id = None
+        self._playback_segments = []
+        self._playback_segment_idx = 0
+
+        self.refresh_bindings()
+        self._update_preview()
+
+    def _on_playback_tick(self) -> None:
+        if self._player is None:
+            return
+        t = self._player.time_pos
+        if t is None:
+            self._stop_playback()
+            return
+        self._update_playback_status_text(t)
+        if self._playback_segments:
+            new_idx = find_segment_index(self._playback_segments, t)
+            if new_idx != self._playback_segment_idx:
+                self._playback_segment_idx = new_idx
+                self._render_preview_with_highlight()
+
+    def _update_playback_status_text(self, t: float) -> None:
+        try:
+            status = self.query_one("#playback-status", PlaybackStatus)
+        except Exception:
+            return
+        pos = format_timestamp(t)
+        duration = self._player.duration if self._player is not None else None
+        if duration is not None:
+            status.update(
+                f"\u266a Playing {self._playback_memo_id} \u2014 {pos} / {format_timestamp(duration)}"
+            )
+        else:
+            status.update(
+                f"\u266a Playing {self._playback_memo_id} \u2014 {pos}"
+            )
+
+    def _render_preview_with_highlight(self) -> None:
+        if not self._is_playing or not self._playback_segments:
+            self._update_preview()
+            return
+        if self._get_selected_row_key() != self._playback_memo_hash:
+            self._update_preview()
+            return
+
+        text = Text()
+        for i, seg in enumerate(self._playback_segments):
+            line = f"[{format_timestamp(seg.start)}] {seg.text}"
+            if i == self._playback_segment_idx:
+                text.append(line, style="reverse")
+            else:
+                text.append(line)
+            if i < len(self._playback_segments) - 1:
+                text.append("\n")
+
+        preview = self.query_one("#preview", MemoPreview)
+        preview.update(text)
 
     def action_toggle_timestamps(self) -> None:
         """Toggle timestamp display in preview pane."""
@@ -1280,6 +1520,12 @@ class EasyTransApp(App):
     def action_quit(self) -> None:
         """Quit, killing any background transcription processes."""
         self._shutting_down.set()
+        if self._player is not None:
+            try:
+                self._player.stop()
+            except Exception:
+                pass
+            self._player = None
         for p in list(self._active_processes):
             p.kill()
         self.workers.cancel_all()

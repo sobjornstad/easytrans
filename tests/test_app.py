@@ -11,7 +11,15 @@ from sqlalchemy.orm import Session
 from textual.coordinate import Coordinate
 from textual.widgets import DataTable, Static
 
-from easytrans.app import EasyTransApp, GotoStatus, MemoPreview, MemoTable, SyncProgressModal
+from easytrans.app import (
+    EasyTransApp,
+    GotoStatus,
+    MemoPreview,
+    MemoTable,
+    PlaybackStatus,
+    SyncProgressModal,
+)
+from easytrans.playback import StubAudioPlayer
 from easytrans.config import EasyTransConfig, RecorderConfig, WhisperConfig
 from easytrans.files import compute_file_hash, text_path
 from easytrans.models import Base, Memo, Transcription
@@ -1371,3 +1379,321 @@ async def test_default_model_upgrade_skipped_when_same_as_initial(tmp_path: Path
             await pilot.pause(delay=2.0)
 
     mock_tm.assert_not_called()
+
+
+# --- Playback tests ---
+
+
+def _add_memo_with_audio_and_segments(
+    app: EasyTransApp,
+    tmp_path: Path,
+    file_hash: str = "phash1",
+    file_id: str = "2026-0010",
+    segments_text: str = "[00:00] First line\n[00:05] Second line\n[00:10] Third line",
+) -> None:
+    """Add a memo, fake audio source file, .md file, and timestamped DB transcription."""
+    _add_memo(app.engine, tmp_path, file_hash=file_hash, file_id=file_id, text="clean text")
+
+    # Create a fake source audio file so find_source_audio() succeeds.
+    year = file_id.split("-")[0]
+    audio_dir = tmp_path / "data" / "audio" / year
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    (audio_dir / f"{file_id}.mp3").write_bytes(b"")
+
+    # Add a transcription with the timestamped segments.
+    with Session(app.engine) as session:
+        t = Transcription(
+            memo_hash=file_hash,
+            transcribed_at=datetime(2026, 1, 15, 13, 0, tzinfo=timezone.utc),
+            model_name="tiny",
+            text=segments_text,
+        )
+        session.add(t)
+        session.commit()
+
+
+def _install_stub_player(app: EasyTransApp) -> list[StubAudioPlayer]:
+    """Patch _make_audio_player to record and return stub players."""
+    created: list[StubAudioPlayer] = []
+
+    def factory():
+        p = StubAudioPlayer(duration=60.0)
+        created.append(p)
+        return p
+
+    app._make_audio_player = factory  # type: ignore[method-assign]
+    return created
+
+
+@pytest.mark.asyncio
+async def test_play_starts_playback(tmp_path: Path) -> None:
+    app = _make_app(tmp_path)
+    _add_memo_with_audio_and_segments(app, tmp_path)
+    players = _install_stub_player(app)
+
+    async with app.run_test() as pilot:
+        await pilot.press("p")
+        await pilot.pause()
+        assert len(players) == 1
+        assert players[0].is_playing is True
+        assert app._is_playing is True
+        assert app.show_timestamps is True
+        assert len(app._playback_segments) == 3
+        assert app._playback_segment_idx == 0
+        status = app.query_one("#playback-status", PlaybackStatus)
+        assert "visible" in status.classes
+
+
+@pytest.mark.asyncio
+async def test_p_toggles_stop(tmp_path: Path) -> None:
+    app = _make_app(tmp_path)
+    _add_memo_with_audio_and_segments(app, tmp_path)
+    players = _install_stub_player(app)
+
+    async with app.run_test() as pilot:
+        await pilot.press("p")
+        await pilot.pause()
+        assert app._is_playing is True
+        prior_show = app._playback_saved_show_timestamps
+
+        await pilot.press("p")
+        await pilot.pause()
+        assert app._is_playing is False
+        assert players[0].stop_called is True
+        assert app.show_timestamps == prior_show
+        status = app.query_one("#playback-status", PlaybackStatus)
+        assert "visible" not in status.classes
+
+
+@pytest.mark.asyncio
+async def test_seek_forward_and_back(tmp_path: Path) -> None:
+    app = _make_app(tmp_path)
+    _add_memo_with_audio_and_segments(app, tmp_path)
+    players = _install_stub_player(app)
+
+    async with app.run_test() as pilot:
+        await pilot.press("p")
+        await pilot.pause()
+
+        await pilot.press("greater_than_sign")
+        await pilot.pause()
+        assert players[0].relative_seeks == [5.0]
+
+        await pilot.press("less_than_sign")
+        await pilot.pause()
+        assert players[0].relative_seeks == [5.0, -5.0]
+
+
+@pytest.mark.asyncio
+async def test_down_during_playback_advances_segment(tmp_path: Path) -> None:
+    app = _make_app(tmp_path)
+    _add_memo_with_audio_and_segments(app, tmp_path)
+    players = _install_stub_player(app)
+
+    async with app.run_test() as pilot:
+        await pilot.press("p")
+        await pilot.pause()
+        assert app._playback_segment_idx == 0
+
+        await pilot.press("down")
+        await pilot.pause()
+        assert app._playback_segment_idx == 1
+        assert players[0].absolute_seeks == [5.0]
+        assert players[0].time_pos == 5.0
+
+        await pilot.press("down")
+        await pilot.pause()
+        assert app._playback_segment_idx == 2
+        assert players[0].absolute_seeks == [5.0, 10.0]
+
+
+@pytest.mark.asyncio
+async def test_up_during_playback_goes_back_a_segment(tmp_path: Path) -> None:
+    app = _make_app(tmp_path)
+    _add_memo_with_audio_and_segments(app, tmp_path)
+    players = _install_stub_player(app)
+
+    async with app.run_test() as pilot:
+        await pilot.press("p")
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.pause()
+        assert app._playback_segment_idx == 2
+
+        await pilot.press("up")
+        await pilot.pause()
+        assert app._playback_segment_idx == 1
+        assert players[0].absolute_seeks[-1] == 5.0
+
+
+@pytest.mark.asyncio
+async def test_j_during_playback_stops_and_navigates(tmp_path: Path) -> None:
+    app = _make_app(tmp_path)
+    _add_memo_with_audio_and_segments(app, tmp_path, file_hash="phash1", file_id="2026-0010")
+    _add_memo_with_audio_and_segments(app, tmp_path, file_hash="phash2", file_id="2026-0011")
+    players = _install_stub_player(app)
+
+    async with app.run_test() as pilot:
+        assert app._get_selected_row_key() == "phash1"
+        await pilot.press("p")
+        await pilot.pause()
+        assert app._is_playing is True
+
+        await pilot.press("j")
+        await pilot.pause()
+        assert app._is_playing is False
+        assert players[0].stop_called is True
+        assert app._get_selected_row_key() == "phash2"
+
+
+@pytest.mark.asyncio
+async def test_k_during_playback_stops_and_navigates(tmp_path: Path) -> None:
+    app = _make_app(tmp_path)
+    _add_memo_with_audio_and_segments(app, tmp_path, file_hash="phash1", file_id="2026-0010")
+    _add_memo_with_audio_and_segments(app, tmp_path, file_hash="phash2", file_id="2026-0011")
+    players = _install_stub_player(app)
+
+    async with app.run_test() as pilot:
+        await pilot.press("j")
+        await pilot.pause()
+        assert app._get_selected_row_key() == "phash2"
+
+        await pilot.press("p")
+        await pilot.pause()
+        assert app._is_playing is True
+
+        await pilot.press("k")
+        await pilot.pause()
+        assert app._is_playing is False
+        assert players[0].stop_called is True
+        assert app._get_selected_row_key() == "phash1"
+
+
+@pytest.mark.asyncio
+async def test_up_outside_playback_navigates_table(tmp_path: Path) -> None:
+    app = _make_app(tmp_path)
+    _add_memo_with_audio_and_segments(app, tmp_path, file_hash="phash1", file_id="2026-0010")
+    _add_memo_with_audio_and_segments(app, tmp_path, file_hash="phash2", file_id="2026-0011")
+
+    async with app.run_test() as pilot:
+        await pilot.press("down")
+        await pilot.pause()
+        assert app._get_selected_row_key() == "phash2"
+        await pilot.press("up")
+        await pilot.pause()
+        assert app._get_selected_row_key() == "phash1"
+
+
+@pytest.mark.asyncio
+async def test_tick_updates_segment_highlight(tmp_path: Path) -> None:
+    app = _make_app(tmp_path)
+    _add_memo_with_audio_and_segments(app, tmp_path)
+    players = _install_stub_player(app)
+
+    async with app.run_test() as pilot:
+        await pilot.press("p")
+        await pilot.pause()
+        assert app._playback_segment_idx == 0
+
+        players[0].time_pos = 7.0
+        app._on_playback_tick()
+        await pilot.pause()
+        assert app._playback_segment_idx == 1
+
+        players[0].time_pos = 12.0
+        app._on_playback_tick()
+        await pilot.pause()
+        assert app._playback_segment_idx == 2
+
+
+@pytest.mark.asyncio
+async def test_tick_natural_end_stops_playback(tmp_path: Path) -> None:
+    app = _make_app(tmp_path)
+    _add_memo_with_audio_and_segments(app, tmp_path)
+    players = _install_stub_player(app)
+
+    async with app.run_test() as pilot:
+        await pilot.press("p")
+        await pilot.pause()
+
+        players[0].time_pos = None
+        app._on_playback_tick()
+        await pilot.pause()
+        assert app._is_playing is False
+
+
+@pytest.mark.asyncio
+async def test_play_with_no_transcription(tmp_path: Path) -> None:
+    """Playback still works for a memo with no DB transcription (no highlight)."""
+    app = _make_app(tmp_path)
+    _add_memo(app.engine, tmp_path, file_hash="phash1", file_id="2026-0010", text="clean")
+    audio_dir = tmp_path / "data" / "audio" / "2026"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    (audio_dir / "2026-0010.mp3").write_bytes(b"")
+    players = _install_stub_player(app)
+
+    async with app.run_test() as pilot:
+        await pilot.press("p")
+        await pilot.pause()
+        assert app._is_playing is True
+        assert app._playback_segments == []
+        assert app.show_timestamps is False
+        assert players[0].is_playing is True
+
+
+@pytest.mark.asyncio
+async def test_quit_stops_playback(tmp_path: Path) -> None:
+    app = _make_app(tmp_path)
+    _add_memo_with_audio_and_segments(app, tmp_path)
+    players = _install_stub_player(app)
+
+    async with app.run_test() as pilot:
+        await pilot.press("p")
+        await pilot.pause()
+        assert players[0].is_playing is True
+        app.action_quit()
+        await pilot.pause()
+        assert players[0].stop_called is True
+
+
+@pytest.mark.asyncio
+async def test_play_no_audio_file_warns(tmp_path: Path) -> None:
+    app = _make_app(tmp_path)
+    _add_memo(app.engine, tmp_path, file_hash="phash1", file_id="2026-0010")
+    with Session(app.engine) as session:
+        session.add(Transcription(
+            memo_hash="phash1",
+            transcribed_at=datetime(2026, 1, 15, 13, 0, tzinfo=timezone.utc),
+            model_name="tiny",
+            text="[00:00] hi",
+        ))
+        session.commit()
+    players = _install_stub_player(app)
+
+    async with app.run_test() as pilot:
+        await pilot.press("p")
+        await pilot.pause()
+        assert app._is_playing is False
+        assert players == []
+
+
+@pytest.mark.asyncio
+async def test_highlight_renders_in_preview(tmp_path: Path) -> None:
+    app = _make_app(tmp_path)
+    _add_memo_with_audio_and_segments(app, tmp_path)
+    _install_stub_player(app)
+
+    async with app.run_test() as pilot:
+        await pilot.press("p")
+        await pilot.pause()
+        preview_text = app.query_one("#preview-text", Static)
+        from rich.text import Text as RichText
+        content = preview_text.content
+        assert isinstance(content, RichText)
+        assert "First line" in content.plain
+        assert "Second line" in content.plain
+        assert "Third line" in content.plain
+        styles = [str(span.style) for span in content.spans]
+        assert any("reverse" in s for s in styles)

@@ -20,6 +20,11 @@
       "Read(//sys/devices/virtual/powercap/intel-rapl/intel-rapl:0/**)",
       "Read(//sys/devices/system/cpu/intel_pstate/**)",
       "Bash(uv run *)",
+      "Bash(/home/soren/.claude/skills/tmux-tui/scripts/tui.sh send-and-capture *)",
+      "Bash(/home/soren/.claude/skills/tmux-tui/scripts/tui.sh stop *)",
+      "Bash(/home/soren/.claude/skills/tmux-tui/scripts/tui.sh capture *)",
+      "Bash(tmux new-session *)",
+      "Bash(tmux capture-pane *)",
       "Bash(jj st *)",
       "Bash(jj log *)",
       "Bash(jj diff *)"

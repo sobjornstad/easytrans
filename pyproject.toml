@@ -10,6 +10,7 @@ dependencies = [
     "faster-whisper>=1.0",
     "tomli>=2.0; python_version < '3.11'",
     "alembic>=1.18.4",
+    "python-mpv>=1.0",
 ]
 
 [project.scripts]
