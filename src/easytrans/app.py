@@ -888,6 +888,7 @@ class EasyTransApp(App):
         """Reload memo list from database, preserving cursor position."""
         table = self.query_one("#memo-table", DataTable)
         saved_key = self._get_selected_row_key()
+        saved_scroll_y = table.scroll_y
 
         # --- Collect row data first so we can size columns dynamically ---
         rows: list[tuple[str, list]] = []  # (file_hash, [cells...])
@@ -954,26 +955,34 @@ class EasyTransApp(App):
         preview_content_w = max(preview_content_w, 10)
 
         # --- Build columns ---
-        table.clear(columns=True)
-        table.add_column("", width=1)
-        table.add_column("ID", width=9)
-        table.add_column("Length", width=6)
-        table.add_column("Model", width=model_width)
-        table.add_column("Preview", width=preview_content_w)
-        if self._show_date_columns:
-            table.add_column("Recorded", width=16)
-            table.add_column("Transcribed", width=16)
+        # Suppress the DataTable's auto-scroll-to-cursor while we rebuild and
+        # restore the cursor, so the viewport does not jump. The caller's
+        # scroll offset is restored explicitly below.
+        table._skip_auto_scroll = True
+        try:
+            table.clear(columns=True)
+            table.add_column("", width=1)
+            table.add_column("ID", width=9)
+            table.add_column("Length", width=6)
+            table.add_column("Model", width=model_width)
+            table.add_column("Preview", width=preview_content_w)
+            if self._show_date_columns:
+                table.add_column("Recorded", width=16)
+                table.add_column("Transcribed", width=16)
 
-        # --- Add rows ---
-        for file_hash, cells in rows:
-            # Truncate preview to available width
-            max_chars = max(60, preview_content_w)
-            cells[4] = cells[4][:max_chars]
-            if not self._show_date_columns:
-                cells = cells[:5]
-            table.add_row(*cells, key=file_hash, height=None)
+            # --- Add rows ---
+            for file_hash, cells in rows:
+                # Truncate preview to available width
+                max_chars = max(60, preview_content_w)
+                cells[4] = cells[4][:max_chars]
+                if not self._show_date_columns:
+                    cells = cells[:5]
+                table.add_row(*cells, key=file_hash, height=None)
 
-        self._move_cursor_to_key(saved_key)
+            self._move_cursor_to_key(saved_key)
+        finally:
+            table._skip_auto_scroll = False
+        table.scroll_to(y=saved_scroll_y, animate=False)
         self._last_refresh_width = table.size.width
         new_key = self._get_selected_row_key()
         if new_key != self._previewed_hash:

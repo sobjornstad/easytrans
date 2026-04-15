@@ -190,6 +190,89 @@ async def test_mark_complete_stays_on_last_row(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_mark_complete_does_not_scroll_when_next_row_visible(
+    tmp_path: Path,
+) -> None:
+    """Pressing 'd' mid-viewport in a scrolled list must not shift the viewport.
+
+    Regression: `_refresh_table` used to clear the DataTable (resetting
+    scroll_y to 0) and then move the cursor back, which re-triggered
+    auto-scroll and pinned the cursor row to the bottom of the viewport.
+    """
+    app = _make_app(tmp_path)
+    for i in range(40):
+        _add_memo(app.engine, tmp_path, f"hash{i:02d}", f"2026-{i:04d}")
+
+    async with app.run_test(size=(120, 15)) as pilot:
+        table = app.query_one("#memo-table", DataTable)
+        assert table.row_count == 40
+
+        # Scroll the list down by pressing j (which pushes the cursor to the
+        # bottom of the viewport and then starts scrolling), then press k a
+        # few times to park the cursor in the middle of the viewport while
+        # leaving the scroll offset non-zero.
+        for _ in range(20):
+            await pilot.press("j")
+        for _ in range(3):
+            await pilot.press("k")
+        await pilot.pause()
+
+        scroll_y_before = float(table.scroll_y)
+        cursor_row_before = table.cursor_coordinate.row
+        assert scroll_y_before > 0  # viewport is scrolled
+        # Sanity: the next row below the cursor is currently visible (i.e.,
+        # it sits above the bottom edge of the viewport).
+        bottom_visible_row = table.scroll_offset.y + table.scrollable_size.height - 1
+        assert cursor_row_before + 1 <= bottom_visible_row
+
+        await pilot.press("d")
+        await pilot.pause()
+
+        # Cursor advanced by one…
+        assert table.cursor_coordinate.row == cursor_row_before + 1
+        # …and the viewport stayed put.
+        assert float(table.scroll_y) == pytest.approx(scroll_y_before, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_mark_complete_scrolls_one_row_when_at_bottom_of_viewport(
+    tmp_path: Path,
+) -> None:
+    """Pressing 'd' on the last visible row scrolls the list by exactly one."""
+    app = _make_app(tmp_path)
+    for i in range(40):
+        _add_memo(app.engine, tmp_path, f"hash{i:02d}", f"2026-{i:04d}")
+
+    async with app.run_test(size=(120, 15)) as pilot:
+        table = app.query_one("#memo-table", DataTable)
+
+        # Scroll partway down first so this is a realistic mid-list case.
+        for _ in range(15):
+            await pilot.press("j")
+        await pilot.pause()
+
+        # Now move cursor to the bottom of the current viewport.
+        viewport_rows = max(int(table.size.height) - 1, 1)
+        scroll_y_before = float(table.scroll_y)
+        last_visible_row = int(scroll_y_before) + viewport_rows - 1
+        while table.cursor_coordinate.row < last_visible_row:
+            await pilot.press("j")
+        await pilot.pause()
+
+        # Still scrolled to the same offset; cursor is on the last visible row.
+        assert float(table.scroll_y) == pytest.approx(scroll_y_before, abs=0.01)
+        cursor_row_before = table.cursor_coordinate.row
+        assert cursor_row_before == last_visible_row
+
+        await pilot.press("d")
+        await pilot.pause()
+
+        # Cursor advanced by one row; scroll advanced by exactly one.
+        assert table.cursor_coordinate.row == cursor_row_before + 1
+        assert float(table.scroll_y) == pytest.approx(scroll_y_before + 1.0, abs=0.01)
+
+
+@pytest.mark.asyncio
 async def test_column_order_wide(tmp_path: Path) -> None:
     """On a wide terminal, all columns including dates are shown."""
     app = _make_app(tmp_path)
