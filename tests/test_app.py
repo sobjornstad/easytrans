@@ -999,6 +999,192 @@ async def test_preview_scroll_resets_on_row_change(tmp_path: Path) -> None:
         assert preview.scroll_y == 0
 
 
+@pytest.mark.asyncio
+async def test_preview_scroll_preserved_on_other_memo_update(tmp_path: Path) -> None:
+    """Background transcription of a different memo must not reset preview scroll.
+
+    Regression: when a background transcription finishes for memo B while the
+    user is viewing memo A, _update_memo_row used to call _update_preview which
+    unconditionally scrolled to the top.
+    """
+    app = _make_app(tmp_path)
+    _add_memo_long_text(app.engine, tmp_path, lines=50)  # hash=abc123, first row
+    _add_memo(app.engine, tmp_path, file_hash="hash2", file_id="2026-0002",
+              text="Short memo two")
+
+    async with app.run_test(size=(120, 20)) as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        preview = app.query_one("#preview", MemoPreview)
+
+        # Stay on row 0 (the long memo). Scroll the preview down.
+        assert app._get_selected_row_key() == "abc123"
+        await pilot.press("tab")
+        await pilot.pause()
+        await pilot.press("ctrl+d")
+        await pilot.press("ctrl+d")
+        await pilot.pause()
+        scrolled_to = preview.scroll_y
+        assert scrolled_to > 0
+
+        # Simulate a background transcription completing for the OTHER memo.
+        # Add a new transcription record for hash2 and then call
+        # _update_memo_row, which is what the worker would do via
+        # call_from_thread.
+        with Session(app.engine) as session:
+            t = Transcription(
+                memo_hash="hash2",
+                transcribed_at=datetime(2026, 2, 16, 12, 0, tzinfo=timezone.utc),
+                model_name="tiny",
+                text="[00:00] freshly transcribed",
+            )
+            session.add(t)
+            session.commit()
+        md = text_path(app.config.data_dir, "2026-0002")
+        md.parent.mkdir(parents=True, exist_ok=True)
+        md.write_text("freshly transcribed\n")
+
+        with Session(app.engine) as session:
+            memo2 = session.get(Memo, "hash2")
+            session.expunge(memo2)
+        app._update_memo_row(memo2)
+        await pilot.pause()
+
+        # Preview scroll position must be unchanged.
+        assert preview.scroll_y == scrolled_to
+        # The other row's Preview cell should have been updated, though.
+        assert "freshly transcribed" in table.get_cell_at(Coordinate(1, 4))
+
+
+@pytest.mark.asyncio
+async def test_preview_content_updated_in_place_for_selected_memo(tmp_path: Path) -> None:
+    """Background transcription of the selected memo should update its
+    content in place without resetting scroll position."""
+    app = _make_app(tmp_path)
+    # Need enough text so the preview is scrollable after update.
+    initial = "\n".join(f"Initial line {i}" for i in range(50))
+    _add_memo(app.engine, tmp_path, text=initial)
+
+    async with app.run_test(size=(120, 20)) as pilot:
+        preview = app.query_one("#preview", MemoPreview)
+        inner = preview.query_one("#preview-text", Static)
+
+        assert app._get_selected_row_key() == "abc123"
+
+        # Scroll the preview partway down.
+        await pilot.press("tab")
+        await pilot.pause()
+        await pilot.press("ctrl+d")
+        await pilot.pause()
+        scrolled_to = preview.scroll_y
+        assert scrolled_to > 0
+
+        # Simulate a background transcription completing: update the .md file
+        # and add a transcription record, then call _update_memo_row.
+        updated = "\n".join(f"Updated line {i}" for i in range(50))
+        md = text_path(app.config.data_dir, "2026-0001")
+        md.write_text(updated + "\n")
+        with Session(app.engine) as session:
+            t = Transcription(
+                memo_hash="abc123",
+                transcribed_at=datetime(2026, 2, 16, 12, 0, tzinfo=timezone.utc),
+                model_name="tiny",
+                text="[00:00] " + updated,
+            )
+            session.add(t)
+            session.commit()
+            memo = session.get(Memo, "abc123")
+            session.expunge(memo)
+        app._update_memo_row(memo)
+        await pilot.pause()
+
+        # Content was updated.
+        content = str(inner._Static__content)
+        assert "Updated line" in content
+        # Scroll position preserved.
+        assert preview.scroll_y == scrolled_to
+
+
+@pytest.mark.asyncio
+async def test_retranscribe_does_not_rebuild_table(tmp_path: Path) -> None:
+    """action_retranscribe should update just the target row's cells, not
+    tear down and rebuild the whole DataTable.
+
+    Regression: _do_retranscribe used to call _refresh_table, which clears
+    all columns and rows — causing cursor/scroll churn in the table itself.
+    """
+    app = _make_app(tmp_path)
+    # Disable the default-model upgrade so the startup background worker
+    # doesn't race with our retranscribe worker.
+    app.config.whisper.default_model = app.config.whisper.initial_model
+    _add_memo(app.engine, tmp_path, text="original")
+    with Session(app.engine) as session:
+        t = Transcription(
+            memo_hash="abc123",
+            transcribed_at=datetime(2026, 1, 15, 13, 0, tzinfo=timezone.utc),
+            model_name="tiny",
+            text="[00:00] original",
+        )
+        session.add(t)
+        session.commit()
+
+    def mock_transcribe(config, session, memo, **kwargs):
+        # Write a new transcription record at the large model tier.
+        model = kwargs.get("model_name") or config.whisper.default_model
+        t = Transcription(
+            memo_hash=memo.file_hash,
+            transcribed_at=datetime(2026, 2, 16, 12, 0, tzinfo=timezone.utc),
+            model_name=model,
+            text="[00:00] upgraded",
+        )
+        session.add(t)
+        session.flush()
+        md = text_path(config.data_dir, memo.file_id)
+        md.parent.mkdir(parents=True, exist_ok=True)
+        md.write_text("upgraded\n")
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        table = app.query_one("#memo-table", DataTable)
+
+        # Snapshot the column objects before retranscribe.
+        cols_before = list(table.columns.values())
+
+        with patch("easytrans.app.transcribe_memo", side_effect=mock_transcribe):
+            await pilot.press("r")
+            # Wait for the background worker to finish.
+            await pilot.pause(delay=2.0)
+
+        # Column objects must be the same instances — no table.clear() happened.
+        cols_after = list(table.columns.values())
+        assert cols_before == cols_after, "retranscribe rebuilt the DataTable"
+
+        # Row cells were updated.
+        assert table.get_cell_at(Coordinate(0, 3)) == app.config.whisper.large_model
+        assert "upgraded" in table.get_cell_at(Coordinate(0, 4))
+
+
+@pytest.mark.asyncio
+async def test_resize_without_width_change_does_not_rebuild(tmp_path: Path) -> None:
+    """MemoTable.on_resize should skip _refresh_table when width is unchanged.
+
+    Regression: any on_resize event used to trigger a full table rebuild,
+    even for height-only reflows (e.g., a sibling widget resizing).
+    """
+    app = _make_app(tmp_path)
+    _add_memo(app.engine, tmp_path, text="a memo")
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        cols_before = list(table.columns.values())
+
+        # Call on_resize directly with a stub event — width is unchanged,
+        # so the handler should short-circuit without rebuilding.
+        table.on_resize(None)
+        await pilot.pause()
+
+        cols_after = list(table.columns.values())
+        assert cols_before == cols_after, "same-width resize rebuilt the table"
+
+
 # --- Scroll-other-pane tests ---
 
 

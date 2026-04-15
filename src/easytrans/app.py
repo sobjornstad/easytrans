@@ -373,10 +373,18 @@ class MemoTable(DataTable):
         self._skip_auto_scroll: bool = False
 
     def on_resize(self, event) -> None:
-        """Rebuild table layout when the table widget itself is resized."""
+        """Rebuild table layout when the table's width changes.
+
+        Skip rebuild on resizes that don't change width (e.g., a sibling
+        widget's height changing while the preview pane reflows). Column
+        widths only depend on width, so a height-only resize is a no-op.
+        """
         app = self.app
-        if hasattr(app, "_refresh_table"):
-            app._refresh_table()
+        if not hasattr(app, "_refresh_table"):
+            return
+        if self.size.width == app._last_refresh_width:
+            return
+        app._refresh_table()
 
     def _render_cell(self, row_index, column_index, base_style, width,
                      cursor=False, hover=False):
@@ -758,6 +766,8 @@ class EasyTransApp(App):
         self._session_completed: set[str] = set()
         # Whether date columns are currently visible
         self._show_date_columns: bool = True
+        self._last_refresh_width: int = 0
+        self._previewed_hash: str | None = None
         # Child processes running Whisper; killed on quit
         self._active_processes: set = set()
         # Event signalling that the app is shutting down; checked by workers
@@ -989,7 +999,12 @@ class EasyTransApp(App):
             table.add_row(*cells, key=file_hash, height=None)
 
         self._move_cursor_to_key(saved_key)
-        self._update_preview()
+        self._last_refresh_width = table.size.width
+        new_key = self._get_selected_row_key()
+        if new_key != self._previewed_hash:
+            self._show_preview_for_selected()
+        else:
+            self._refresh_preview_content()
 
     def _get_selected_memo(self) -> Memo | None:
         """Get the currently selected memo from the table."""
@@ -1002,42 +1017,25 @@ class EasyTransApp(App):
                 session.expunge(memo)
             return memo
 
-    def _update_preview(self) -> None:
-        """Update the preview pane with the selected memo's text."""
-        preview = self.query_one("#preview", MemoPreview)
-        memo = self._get_selected_memo()
-        if memo is None:
-            preview.update("No memo selected")
-            return
-
-        if (
-            self._is_playing
-            and self._playback_segments
-            and memo.file_hash == self._playback_memo_hash
-        ):
-            self._render_preview_with_highlight()
-            return
-
-        parts = []
-
-        # Show dates in preview when date columns are hidden
-        if not self._show_date_columns:
-            recorded = memo.recorded_at.strftime("%Y-%m-%d %H:%M")
-            parts.append(f"Recorded: {recorded}")
+    def _build_preview_content(self, memo: Memo) -> str:
+        """Build the preview pane text for a memo."""
+        needs_latest = not self._show_date_columns or self.show_timestamps
+        latest = None
+        if needs_latest:
             with Session(self.engine) as session:
-                t = get_latest_transcription(session, memo.file_hash)
-                if t:
-                    transcribed = t.transcribed_at.strftime("%Y-%m-%d %H:%M")
-                    parts.append(f"Transcribed: {transcribed}")
+                latest = get_latest_transcription(session, memo.file_hash)
+
+        parts: list[str] = []
+        if not self._show_date_columns:
+            parts.append(f"Recorded: {memo.recorded_at.strftime('%Y-%m-%d %H:%M')}")
+            if latest:
+                parts.append(
+                    f"Transcribed: {latest.transcribed_at.strftime('%Y-%m-%d %H:%M')}"
+                )
             parts.append("")
 
         if self.show_timestamps:
-            with Session(self.engine) as session:
-                t = get_latest_transcription(session, memo.file_hash)
-                if t:
-                    parts.append(t.text)
-                else:
-                    parts.append("(not yet transcribed)")
+            parts.append(latest.text if latest else "(not yet transcribed)")
         else:
             md = text_path(self.config.data_dir, memo.file_id)
             if md.exists():
@@ -1046,11 +1044,51 @@ class EasyTransApp(App):
             else:
                 parts.append("(not yet transcribed)")
 
-        preview.update("\n".join(parts))
+        return "\n".join(parts)
+
+    def _show_preview_for_selected(self) -> None:
+        """Load the selected memo's content into the preview pane and scroll
+        to the top. Call this on selection change."""
+        preview = self.query_one("#preview", MemoPreview)
+        memo = self._get_selected_memo()
+        if memo is None:
+            preview.update("No memo selected")
+            preview.scroll_home(animate=False)
+            self._previewed_hash = None
+            return
+        if (
+            self._is_playing
+            and self._playback_segments
+            and memo.file_hash == self._playback_memo_hash
+        ):
+            self._render_preview_with_highlight()
+        else:
+            preview.update(self._build_preview_content(memo))
         preview.scroll_home(animate=False)
+        self._previewed_hash = memo.file_hash
+
+    def _refresh_preview_content(self) -> None:
+        """Refresh the preview pane in place, preserving scroll position.
+        No-op if the selected memo is not the one currently previewed (i.e.,
+        a background update for a memo the user isn't looking at)."""
+        memo = self._get_selected_memo()
+        if memo is None or memo.file_hash != self._previewed_hash:
+            return
+        if (
+            self._is_playing
+            and self._playback_segments
+            and memo.file_hash == self._playback_memo_hash
+        ):
+            self._render_preview_with_highlight()
+            return
+        preview = self.query_one("#preview", MemoPreview)
+        preview.update(self._build_preview_content(memo))
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        self._update_preview()
+        new_hash = self._get_selected_row_key()
+        if new_hash == self._previewed_hash:
+            return
+        self._show_preview_for_selected()
 
     def on_memo_table_goto_status_changed(self, event: MemoTable.GotoStatusChanged) -> None:
         """Show/hide goto buffer status in the footer area."""
@@ -1256,7 +1294,7 @@ class EasyTransApp(App):
         self._playback_segment_idx = 0
 
         self.refresh_bindings()
-        self._update_preview()
+        self._refresh_preview_content()
 
     def _on_playback_tick(self) -> None:
         if self._player is None:
@@ -1290,10 +1328,10 @@ class EasyTransApp(App):
 
     def _render_preview_with_highlight(self) -> None:
         if not self._is_playing or not self._playback_segments:
-            self._update_preview()
+            self._refresh_preview_content()
             return
         if self._get_selected_row_key() != self._playback_memo_hash:
-            self._update_preview()
+            self._refresh_preview_content()
             return
 
         text = Text()
@@ -1314,7 +1352,7 @@ class EasyTransApp(App):
         self.show_timestamps = not self.show_timestamps
         label = "on" if self.show_timestamps else "off"
         self.notify(f"Timestamps: {label}")
-        self._update_preview()
+        self._refresh_preview_content()
 
     def _build_front_matter(self, memo: Memo) -> str:
         """Build YAML front matter for a memo."""
@@ -1370,7 +1408,7 @@ class EasyTransApp(App):
         # Strip front matter after editing
         edited = md.read_text()
         md.write_text(self._strip_front_matter(edited))
-        self._refresh_table()
+        self._update_memo_row(memo)
 
     def action_copy_text(self) -> None:
         self._copy_to_clipboard(with_timestamps=False)
@@ -1672,8 +1710,9 @@ class EasyTransApp(App):
                 memo.file_hash, 6,
                 latest.transcribed_at.strftime("%Y-%m-%d %H:%M"),
             )
-        # Update preview pane if this memo is currently selected
-        self._update_preview()
+        # Update preview pane only if this memo is currently selected,
+        # preserving scroll position.
+        self._refresh_preview_content()
 
     def action_retranscribe(self) -> None:
         """Re-transcribe the selected memo with the larger model."""
@@ -1708,7 +1747,7 @@ class EasyTransApp(App):
             self.call_from_thread(
                 self.notify, f"Re-transcribed {memo.file_id}"
             )
-            self.call_from_thread(self._refresh_table)
+            self.call_from_thread(self._update_memo_row, memo)
         except Exception as e:
             if self._shutting_down.is_set():
                 return
@@ -1717,7 +1756,10 @@ class EasyTransApp(App):
                 f"Error: {e}",
                 severity="error",
             )
-            self.call_from_thread(self._refresh_table)
+            # Reset the target row's cells (which we previously set to
+            # the target model and "(upgrading...)") back to whatever the
+            # DB currently reflects.
+            self.call_from_thread(self._update_memo_row, memo)
         finally:
             self._retranscribe_worker = None
 

@@ -22,6 +22,7 @@
       "Bash(uv run *)",
       "Bash(/home/soren/.claude/skills/tmux-tui/scripts/tui.sh send-and-capture *)",
       "Bash(/home/soren/.claude/skills/tmux-tui/scripts/tui.sh stop *)",
+      "Bash(/home/soren/.claude/skills/tmux-tui/scripts/tui.sh start *)",
       "Bash(/home/soren/.claude/skills/tmux-tui/scripts/tui.sh capture *)",
       "Bash(tmux new-session *)",
       "Bash(tmux capture-pane *)",
