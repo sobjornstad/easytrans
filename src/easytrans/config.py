@@ -54,10 +54,20 @@ class WhisperConfig:
 
 
 @dataclass
+class RecordingConfig:
+    # Input device for sounddevice. None = system default; a string
+    # matches by substring, an int selects by portaudio index.
+    device: str | int | None = None
+    # 16 kHz is what Whisper resamples to anyway; keeps files small.
+    samplerate: int = 16000
+
+
+@dataclass
 class EasyTransConfig:
     data_dir: Path = field(default_factory=lambda: Path.home() / "easytrans-data")
     recorder: RecorderConfig = field(default_factory=RecorderConfig)
     whisper: WhisperConfig = field(default_factory=WhisperConfig)
+    recording: RecordingConfig = field(default_factory=RecordingConfig)
 
     @property
     def audio_dir(self) -> Path:
@@ -71,10 +81,16 @@ class EasyTransConfig:
     def db_path(self) -> Path:
         return self.data_dir / "easytrans.db"
 
+    @property
+    def recording_tmp_dir(self) -> Path:
+        "Staging directory for in-progress recordings before they become memos."
+        return self.data_dir / "tmp"
+
     def ensure_dirs(self) -> None:
         """Create data directories if they don't exist."""
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.text_dir.mkdir(parents=True, exist_ok=True)
+        self.recording_tmp_dir.mkdir(parents=True, exist_ok=True)
 
 
 def load_config(config_path: Path | None = None) -> EasyTransConfig:
@@ -92,6 +108,7 @@ def load_config(config_path: Path | None = None) -> EasyTransConfig:
     paths = data.get("paths", {})
     recorder = data.get("recorder", {})
     whisper = data.get("whisper", {})
+    recording = data.get("recording", {})
 
     data_dir_str = paths.get("data_dir", "~/easytrans-data")
     data_dir = Path(data_dir_str).expanduser()
@@ -108,5 +125,9 @@ def load_config(config_path: Path | None = None) -> EasyTransConfig:
             default_model=whisper.get("default_model", "small"),
             large_model=whisper.get("large_model", "medium"),
             cpu_threads=whisper.get("cpu_threads", 4),
+        ),
+        recording=RecordingConfig(
+            device=recording.get("device"),
+            samplerate=recording.get("samplerate", 16000),
         ),
     )

@@ -20,9 +20,12 @@ from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Static
 
+from datetime import datetime, timezone
+
 from easytrans.config import EasyTransConfig, load_config
 from easytrans.db import get_engine, get_memos, get_latest_transcription, get_memos_needing_upgrade, get_untranscribed_memos
-from easytrans.files import find_source_audio, text_path
+from easytrans.files import compute_file_hash, find_source_audio, text_path
+from easytrans.importer import import_audio_as_memo
 from easytrans.models import Memo
 from easytrans.playback import (
     AudioPlayer,
@@ -31,6 +34,7 @@ from easytrans.playback import (
     find_segment_index,
     parse_segments,
 )
+from easytrans.recording import Recorder
 from easytrans.sync import (
     copy_single_file,
     find_new_files,
@@ -212,6 +216,119 @@ class SyncProgressModal(ModalScreen):
         else:
             display = f"  {icon} {text}"
         self.query_one(f"#{step_id}", Static).update(display)
+
+
+# Seconds above which escape-to-cancel must be confirmed with y/n, so
+# a fat-finger doesn't throw away a recording you've been working on.
+RECORDING_DISCARD_CONFIRM_THRESHOLD_SECONDS = 10
+
+
+class RecordingModal(ModalScreen):
+    """
+    Modal shown while recording audio directly into the app.
+
+    The modal only displays state and gathers the user's intent (save
+    vs. cancel). The actual audio I/O lives in `Recorder`; the app's
+    `_do_record` worker owns the recorder and waits on `done_event`.
+    """
+
+    DEFAULT_CSS = """
+    RecordingModal {
+        align: center middle;
+    }
+    #rec-modal-container {
+        width: 50;
+        height: auto;
+        border: thick $warning;
+        background: $surface;
+        padding: 1 2;
+    }
+    #rec-title {
+        text-align: center;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #rec-timer {
+        text-align: center;
+        text-style: bold;
+        color: $warning;
+        margin-bottom: 1;
+    }
+    #rec-hint {
+        text-align: center;
+        color: $text-muted;
+    }
+    """
+
+    BINDINGS = [
+        Binding("space", "save", "Save", show=False),
+        Binding("enter", "save", "Save", show=False),
+        Binding("escape", "request_cancel", "Cancel", show=False),
+    ]
+
+    def __init__(self, recorder: Recorder) -> None:
+        super().__init__()
+        self._recorder = recorder
+        self._confirming_discard: bool = False
+        self.cancelled: bool = False
+        self.done_event = threading.Event()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="rec-modal-container"):
+            yield Static("\u25cf Recording", id="rec-title")
+            yield Static("00:00", id="rec-timer")
+            yield Static(
+                "space/enter: save   esc: cancel", id="rec-hint",
+            )
+
+    def on_mount(self) -> None:
+        self.set_interval(0.2, self._tick)
+
+    def _tick(self) -> None:
+        elapsed = int(self._recorder.elapsed_seconds)
+        m, s = divmod(elapsed, 60)
+        self.query_one("#rec-timer", Static).update(f"{m:02d}:{s:02d}")
+
+    def _enter_confirm_discard(self) -> None:
+        self._confirming_discard = True
+        self.query_one("#rec-title", Static).update("Discard recording?")
+        self.query_one("#rec-hint", Static).update(
+            "y: discard   n: keep recording",
+        )
+
+    def _leave_confirm_discard(self) -> None:
+        self._confirming_discard = False
+        self.query_one("#rec-title", Static).update("\u25cf Recording")
+        self.query_one("#rec-hint", Static).update(
+            "space/enter: save   esc: cancel",
+        )
+
+    def action_save(self) -> None:
+        if self._confirming_discard:
+            return
+        self.cancelled = False
+        self.done_event.set()
+
+    def action_request_cancel(self) -> None:
+        if self._confirming_discard:
+            # Ignore a second escape while confirming.
+            return
+        if self._recorder.elapsed_seconds >= RECORDING_DISCARD_CONFIRM_THRESHOLD_SECONDS:
+            self._enter_confirm_discard()
+        else:
+            self.cancelled = True
+            self.done_event.set()
+
+    def on_key(self, event: Key) -> None:
+        if not self._confirming_discard:
+            return
+        if event.key == "y":
+            event.stop()
+            self.cancelled = True
+            self.done_event.set()
+        elif event.key == "n":
+            event.stop()
+            self._leave_confirm_discard()
 
 
 class MemoTable(DataTable):
@@ -605,6 +722,7 @@ class EasyTransApp(App):
 
     BINDINGS = [
         Binding("s", "sync", "Sync"),
+        Binding("a", "record", "Record"),
         Binding("h", "toggle_completed", "Hide/Show done"),
         Binding("e", "edit", "Edit"),
         Binding("r", "retranscribe", "Re-transcribe"),
@@ -681,6 +799,8 @@ class EasyTransApp(App):
             return True if playing else False
         if action in ("playback_prev_line", "playback_next_line"):
             return True if playing else False
+        if action == "record":
+            return False if playing else True
         return True
 
     def on_mount(self) -> None:
@@ -708,27 +828,7 @@ class EasyTransApp(App):
     def _do_startup_transcribe(self, memos: list[Memo]) -> None:
         """Background worker to transcribe memos that lack transcriptions."""
         with Session(self.engine) as session:
-            for memo in memos:
-                if self._shutting_down.is_set():
-                    return
-                try:
-                    self.call_from_thread(
-                        self._update_row_cell,
-                        memo.file_hash, 4, "(transcribing...)",
-                    )
-                    transcribe_memo(
-                        self.config, session, memo,
-                        active_processes=self._active_processes,
-                    )
-                    session.commit()
-                    self.call_from_thread(self._update_memo_row, memo)
-                except Exception as e:
-                    if self._shutting_down.is_set():
-                        return
-                    self.call_from_thread(
-                        self._update_row_cell,
-                        memo.file_hash, 4, f"(error: {e})",
-                    )
+            self._transcribe_memos_with_updates(session, memos)
         self.call_from_thread(self._start_default_model_upgrade)
 
     def _start_default_model_upgrade(self) -> None:
@@ -1314,6 +1414,99 @@ class EasyTransApp(App):
         self.push_screen(modal)
         self._do_sync(modal)
 
+    def action_record(self) -> None:
+        """Record audio directly into the app and create a new memo."""
+        recorder = Recorder(self.config)
+        modal = RecordingModal(recorder)
+        self.push_screen(modal)
+        self._do_record(modal, recorder)
+
+    @work(thread=True, exclusive=True, group="record")
+    def _do_record(
+        self, modal: RecordingModal, recorder: Recorder,
+    ) -> None:
+        """
+        Background worker for a direct-recording session.
+
+        Starts the audio stream, waits for the modal's save/cancel
+        signal, then either discards the staging file or imports it
+        as a memo and kicks off transcription. Mirrors the
+        commit-then-transcribe shape of `_do_sync` so the table updates
+        look identical to a fresh sync.
+        """
+        recorded_at = datetime.now(tz=timezone.utc)
+        try:
+            recorder.start()
+        except Exception as e:
+            self.call_from_thread(self.pop_screen)
+            self.call_from_thread(
+                self.notify,
+                f"Could not start recording: {e}",
+                severity="error",
+            )
+            return
+
+        # Wait for user intent (save / cancel) or app shutdown.
+        while not modal.done_event.wait(timeout=0.25):
+            if self._shutting_down.is_set():
+                # Preserve whatever's been captured so far.
+                break
+
+        if modal.cancelled:
+            recorder.cancel()
+            self.call_from_thread(self.pop_screen)
+            return
+
+        try:
+            staging_path = recorder.stop()
+        except Exception as e:
+            self.call_from_thread(self.pop_screen)
+            self.call_from_thread(
+                self.notify,
+                f"Recording finalize failed: {e}",
+                severity="error",
+            )
+            return
+
+        if staging_path.stat().st_size == 0:
+            # Nothing was captured — don't create an empty memo.
+            staging_path.unlink(missing_ok=True)
+            self.call_from_thread(self.pop_screen)
+            self.call_from_thread(
+                self.notify,
+                "Recording was empty — nothing saved.",
+                severity="warning",
+            )
+            return
+
+        try:
+            file_hash = compute_file_hash(staging_path)
+            with Session(self.engine) as session:
+                memo = import_audio_as_memo(
+                    self.config,
+                    session,
+                    staging_path,
+                    file_hash,
+                    recorded_at,
+                    move=True,
+                )
+                session.commit()
+                new_memos = [memo]
+
+                self.call_from_thread(self.pop_screen)
+                self.call_from_thread(self._refresh_table)
+
+                self._transcribe_memos_with_updates(session, new_memos)
+        except Exception as e:
+            self.call_from_thread(
+                self.notify,
+                f"Failed to import recording: {e}",
+                severity="error",
+            )
+            return
+
+        self.call_from_thread(self._start_default_model_upgrade)
+
     @work(thread=True, exclusive=True, group="sync")
     def _do_sync(self, modal: SyncProgressModal) -> None:
         """Background worker that drives the sync and transcription flow."""
@@ -1412,30 +1605,41 @@ class EasyTransApp(App):
                 return
 
             # Transcribe each memo, updating table rows as each completes
-            for memo in new_memos:
+            self._transcribe_memos_with_updates(session, new_memos)
+            self.call_from_thread(self._start_default_model_upgrade)
+
+    def _transcribe_memos_with_updates(
+        self, session: Session, memos: list[Memo],
+    ) -> None:
+        """
+        Run transcription on `memos` in order, refreshing table rows as
+        each completes. Safe to call from a thread worker — UI mutations
+        are marshalled via `call_from_thread`.
+
+        Shared by the sync, direct-record, and startup-catchup paths so
+        they all display progress the same way.
+        """
+        for memo in memos:
+            if self._shutting_down.is_set():
+                return
+            try:
+                self.call_from_thread(
+                    self._update_row_cell,
+                    memo.file_hash, 4, "(transcribing...)",
+                )
+                transcribe_memo(
+                    self.config, session, memo,
+                    active_processes=self._active_processes,
+                )
+                session.commit()
+                self.call_from_thread(self._update_memo_row, memo)
+            except Exception as e:
                 if self._shutting_down.is_set():
                     return
-                try:
-                    self.call_from_thread(
-                        self._update_row_cell,
-                        memo.file_hash, 4, "(transcribing...)",
-                    )
-                    transcribe_memo(
-                        self.config, session, memo,
-                        active_processes=self._active_processes,
-                    )
-                    session.commit()
-                    self.call_from_thread(
-                        self._update_memo_row, memo,
-                    )
-                except Exception as e:
-                    if self._shutting_down.is_set():
-                        return
-                    self.call_from_thread(
-                        self._update_row_cell,
-                        memo.file_hash, 4, f"(error: {e})",
-                    )
-            self.call_from_thread(self._start_default_model_upgrade)
+                self.call_from_thread(
+                    self._update_row_cell,
+                    memo.file_hash, 4, f"(error: {e})",
+                )
 
     def _update_row_cell(self, row_key_value: str, col_idx: int, value: str) -> None:
         """Update a single cell in the table by row key and column index."""

@@ -1,6 +1,5 @@
 """Device sync workflow for EasyTrans."""
 
-import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,30 +9,12 @@ from sqlalchemy.orm import Session
 
 from easytrans.config import EasyTransConfig
 from easytrans.db import hash_exists
-from easytrans.files import audio_path, compute_file_hash, next_file_id
+from easytrans.files import compute_file_hash
+from easytrans.importer import get_audio_duration, import_audio_as_memo
 from easytrans.models import Memo, SourceFile
 
 # Audio file extensions we recognize from recorders
 AUDIO_EXTENSIONS = {".mp3", ".wma", ".wav", ".ogg", ".flac", ".m4a", ".aac"}
-
-
-def get_audio_duration(file_path: Path) -> float | None:
-    """Get audio duration in seconds using ffprobe."""
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe", "-v", "quiet",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                str(file_path),
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return float(result.stdout.strip())
-    except (subprocess.CalledProcessError, ValueError):
-        return None
 
 
 def mount_recorder(config: EasyTransConfig) -> None:
@@ -84,9 +65,13 @@ def sync_files(
     session: Session,
     recorder_files: list[Path],
 ) -> list[Memo]:
-    """Copy new recordings from the recorder into the data directory.
+    """
+    Copy new recordings from the recorder into the data directory.
 
-    Returns a list of newly created Memo objects.
+    Returns a list of newly created Memo objects. Unlike
+    `copy_single_file`, this helper does not write SourceFile cache
+    rows — it hashes every file on every call. Prefer the
+    `find_new_files` + `copy_single_file` path in production code.
     """
     new_memos: list[Memo] = []
 
@@ -95,30 +80,12 @@ def sync_files(
         if hash_exists(session, file_hash):
             continue
 
-        # Get the recording timestamp from the file's modification time
-        stat = src_file.stat()
-        recorded_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-        year = recorded_at.year
-
-        file_id = next_file_id(config.audio_dir, year)
-        ext = src_file.suffix  # preserve original extension
-
-        dest = audio_path(config.data_dir, file_id, ext)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_file, dest)
-
-        duration = get_audio_duration(dest)
-
-        memo = Memo(
-            file_hash=file_hash,
-            file_id=file_id,
-            recorded_at=recorded_at,
-            synced_at=datetime.now(tz=timezone.utc),
-            duration_seconds=duration,
-            completed=False,
+        recorded_at = datetime.fromtimestamp(
+            src_file.stat().st_mtime, tz=timezone.utc,
         )
-        session.add(memo)
-        session.flush()
+        memo = import_audio_as_memo(
+            config, session, src_file, file_hash, recorded_at,
+        )
         new_memos.append(memo)
 
     return new_memos
@@ -175,43 +142,27 @@ def copy_single_file(
     src_file: Path,
     file_hash: str,
 ) -> Memo:
-    """Copy a single recording from the recorder to the data directory.
+    """
+    Copy a single recording from the recorder into the data directory.
 
-    Returns the newly created Memo (flushed but not committed).
-    Also records the source file metadata so future syncs can skip
-    re-hashing this file.
+    Thin wrapper around `import_audio_as_memo` that adds the
+    SourceFile dedup row — the metadata cache that lets future syncs
+    skip re-hashing this file off the USB. Returns the newly created
+    Memo (flushed but not committed).
     """
     stat = src_file.stat()
     recorded_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-    year = recorded_at.year
 
-    file_id = next_file_id(config.audio_dir, year)
-    ext = src_file.suffix
-
-    dest = audio_path(config.data_dir, file_id, ext)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src_file, dest)
-
-    duration = get_audio_duration(dest)
-
-    memo = Memo(
-        file_hash=file_hash,
-        file_id=file_id,
-        recorded_at=recorded_at,
-        synced_at=datetime.now(tz=timezone.utc),
-        duration_seconds=duration,
-        completed=False,
+    memo = import_audio_as_memo(
+        config, session, src_file, file_hash, recorded_at,
     )
-    session.add(memo)
-    session.flush()
 
-    source = SourceFile(
+    session.add(SourceFile(
         filename=src_file.name,
         file_size=stat.st_size,
         mtime_ns=stat.st_mtime_ns,
         file_hash=file_hash,
-    )
-    session.add(source)
+    ))
     session.flush()
 
     return memo

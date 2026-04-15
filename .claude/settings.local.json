@@ -27,7 +27,10 @@
       "Bash(tmux capture-pane *)",
       "Bash(jj st *)",
       "Bash(jj log *)",
-      "Bash(jj diff *)"
+      "Bash(jj diff *)",
+      "Read(//home/soren/easytrans-data/audio/**)",
+      "Read(//home/soren/easytrans-data/**)",
+      "Bash(/home/soren/.claude/skills/tmux-tui/scripts/tui.sh send-keys *)"
     ]
   }
 }

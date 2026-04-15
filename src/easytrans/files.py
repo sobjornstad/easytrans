@@ -14,26 +14,30 @@ def compute_file_hash(file_path: Path) -> str:
 
 
 def next_file_id(audio_dir: Path, year: int) -> str:
-    """Generate the next sequential file ID for a given year.
+    """
+    Generate the next sequential file ID for a given year.
 
-    Scans audio/{year}/ to find the highest existing number
-    and returns the next one in YYYY-NNNN format.
+    Scans audio/{year}/ to find the highest existing number and returns
+    the next one in YYYY-NNNN format. Identity is by *stem*, not full
+    filename, so a memo with both a source file and a derivative WAV
+    (e.g. `2026-0001.mp3` and `2026-0001.wav`) occupies a single slot,
+    and a memo whose source is itself a WAV (direct in-app recording)
+    also correctly occupies its slot.
     """
     year_dir = audio_dir / str(year)
     if not year_dir.exists():
         return f"{year}-0001"
 
-    existing = []
+    used: set[int] = set()
     for f in year_dir.iterdir():
-        if f.stem.startswith(f"{year}-") and f.suffix != ".wav":
-            try:
-                num = int(f.stem.split("-", 1)[1])
-                existing.append(num)
-            except (ValueError, IndexError):
-                continue
+        if not f.stem.startswith(f"{year}-"):
+            continue
+        try:
+            used.add(int(f.stem.split("-", 1)[1]))
+        except (ValueError, IndexError):
+            continue
 
-    next_num = max(existing, default=0) + 1
-    return f"{year}-{next_num:04d}"
+    return f"{year}-{(max(used, default=0) + 1):04d}"
 
 
 def audio_path(data_dir: Path, file_id: str, ext: str) -> Path:
@@ -54,12 +58,24 @@ def text_path(data_dir: Path, file_id: str) -> Path:
 
 
 def find_source_audio(data_dir: Path, file_id: str) -> Path | None:
-    """Find the source (non-WAV) audio file for a memo."""
+    """
+    Find the source audio file for a memo.
+
+    Prefers a non-WAV sibling (the original compressed source for synced
+    memos), but falls back to the WAV itself when it's the only file for
+    the stem (the case for in-app direct recordings, where the WAV *is*
+    the source).
+    """
     year = file_id.split("-")[0]
     year_dir = data_dir / "audio" / year
     if not year_dir.exists():
         return None
+    wav_fallback: Path | None = None
     for f in year_dir.iterdir():
-        if f.stem == file_id and f.suffix.lower() != ".wav":
+        if f.stem != file_id:
+            continue
+        if f.suffix.lower() == ".wav":
+            wav_fallback = f
+        else:
             return f
-    return None
+    return wav_fallback

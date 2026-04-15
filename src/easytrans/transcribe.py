@@ -9,7 +9,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from easytrans.config import EasyTransConfig
-from easytrans.files import text_path, wav_path
+from easytrans.files import find_source_audio, text_path, wav_path
 from easytrans.models import Memo, Transcription
 
 
@@ -135,22 +135,18 @@ def transcribe_memo(
     if model_name is None:
         model_name = config.whisper.initial_model
 
-    # Find the source audio file (non-wav)
-    year = memo.file_id.split("-")[0]
-    year_dir = config.audio_dir / year
-    source = None
-    for f in year_dir.iterdir():
-        if f.stem == memo.file_id and f.suffix.lower() != ".wav":
-            source = f
-            break
-
+    source = find_source_audio(config.data_dir, memo.file_id)
     if source is None:
         raise FileNotFoundError(f"Source audio not found for {memo.file_id}")
 
-    # Convert to WAV
+    # Ensure a WAV exists for Whisper. If the source is already WAV
+    # (in-app direct recording), use it directly; otherwise transcode.
     wav = wav_path(config.data_dir, memo.file_id)
     if not wav.exists():
-        convert_to_wav(source, wav)
+        if source.suffix.lower() == ".wav":
+            wav = source
+        else:
+            convert_to_wav(source, wav)
 
     # Transcribe
     segments = transcribe_audio(

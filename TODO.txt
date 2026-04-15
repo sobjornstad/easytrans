@@ -1,12 +1,13 @@
 Bugs:
 
 - [ ] The preview pane scrolls up to the top again whenever a background transcription finishes
-- [ ] An ID typed into go without a year still tries to select an earlier year even if it’s not on the page I think? Not sure, there was something weird about this navigation
 
 
 Polish/refactor:
 
-- [ ]
+- [ ] An ID typed into go without a year should be smarter
+    - if only one of them is in the current view, show that one
+    - if multiple are in the current view, select the latest one
 
 
 New features (likely):

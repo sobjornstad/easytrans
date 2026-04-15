@@ -11,6 +11,8 @@ dependencies = [
     "tomli>=2.0; python_version < '3.11'",
     "alembic>=1.18.4",
     "python-mpv>=1.0",
+    "sounddevice>=0.4",
+    "soundfile>=0.12",
 ]
 
 [project.scripts]
