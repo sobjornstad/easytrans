@@ -133,7 +133,7 @@ def transcribe_memo(
     in the database, and writes the .md file.
     """
     if model_name is None:
-        model_name = config.whisper.default_model
+        model_name = config.whisper.initial_model
 
     # Find the source audio file (non-wav)
     year = memo.file_id.split("-")[0]

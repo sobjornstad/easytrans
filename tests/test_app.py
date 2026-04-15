@@ -1141,7 +1141,7 @@ async def test_startup_transcribes_untranscribed_memos(tmp_path: Path) -> None:
     transcribed_calls = []
 
     def mock_transcribe(config, session, memo, **kwargs):
-        model = kwargs.get("model_name") or config.whisper.default_model
+        model = kwargs.get("model_name") or config.whisper.initial_model
         transcribed_calls.append((memo.file_hash, model))
         t = Transcription(
             memo_hash=memo.file_hash,
@@ -1190,7 +1190,7 @@ async def test_startup_skips_already_transcribed_memos(tmp_path: Path) -> None:
 
     def mock_transcribe(config, session, memo, **kwargs):
         transcribed_calls.append((memo.file_hash, kwargs.get("model_name")))
-        model = kwargs.get("model_name") or config.whisper.default_model
+        model = kwargs.get("model_name") or config.whisper.initial_model
         t = Transcription(
             memo_hash=memo.file_hash,
             transcribed_at=datetime(2026, 2, 16, 12, 0, tzinfo=timezone.utc),
@@ -1244,19 +1244,19 @@ async def test_startup_no_notification_when_all_transcribed(tmp_path: Path) -> N
     assert not any("pending" in str(n.message) for n in app._notifications)
 
 
-# --- Mid-model upgrade tests ---
+# --- Default-model upgrade tests ---
 
 
 @pytest.mark.asyncio
-async def test_startup_triggers_mid_model_upgrade_after_tier1(tmp_path: Path) -> None:
-    """After tier 1 completes on startup, tier 2 mid-model upgrade triggers."""
+async def test_startup_triggers_default_model_upgrade_after_tier1(tmp_path: Path) -> None:
+    """After tier 1 completes on startup, tier 2 default-model upgrade triggers."""
     app = _make_app(tmp_path)
     _add_memo_no_transcription(app.engine, tmp_path, "hash1", "2026-0001")
 
     transcribed_calls = []
 
     def mock_transcribe(config, session, memo, **kwargs):
-        model = kwargs.get("model_name") or config.whisper.default_model
+        model = kwargs.get("model_name") or config.whisper.initial_model
         transcribed_calls.append((memo.file_hash, model))
         t = Transcription(
             memo_hash=memo.file_hash,
@@ -1280,10 +1280,10 @@ async def test_startup_triggers_mid_model_upgrade_after_tier1(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_startup_triggers_mid_model_upgrade_directly(tmp_path: Path) -> None:
-    """When no tier 1 work needed, mid-model upgrade triggers directly on startup."""
+async def test_startup_triggers_default_model_upgrade_directly(tmp_path: Path) -> None:
+    """When no tier 1 work needed, default-model upgrade triggers directly on startup."""
     app = _make_app(tmp_path)
-    # Memo already has tier 1 transcription but not mid-model
+    # Memo already has tier 1 transcription but not default-model
     _add_memo(app.engine, tmp_path, "hash1", "2026-0001", text="Already done")
     with Session(app.engine) as session:
         t = Transcription(
@@ -1298,7 +1298,7 @@ async def test_startup_triggers_mid_model_upgrade_directly(tmp_path: Path) -> No
     transcribed_calls = []
 
     def mock_transcribe(config, session, memo, **kwargs):
-        model = kwargs.get("model_name") or config.whisper.default_model
+        model = kwargs.get("model_name") or config.whisper.initial_model
         transcribed_calls.append((memo.file_hash, model))
         t = Transcription(
             memo_hash=memo.file_hash,
@@ -1316,13 +1316,13 @@ async def test_startup_triggers_mid_model_upgrade_directly(tmp_path: Path) -> No
         async with app.run_test() as pilot:
             await pilot.pause(delay=3.0)
 
-    # Should only have mid-model upgrade, no tier 1
+    # Should only have default-model upgrade, no tier 1
     assert transcribed_calls == [("hash1", "small")]
 
 
 @pytest.mark.asyncio
-async def test_mid_model_skips_already_upgraded(tmp_path: Path) -> None:
-    """Memos that already have mid-model transcription are not upgraded again."""
+async def test_default_model_upgrade_skips_already_upgraded(tmp_path: Path) -> None:
+    """Memos that already have default-model transcription are not upgraded again."""
     app = _make_app(tmp_path)
     _add_memo(app.engine, tmp_path, "hash1", "2026-0001", text="Done")
     with Session(app.engine) as session:
@@ -1349,11 +1349,11 @@ async def test_mid_model_skips_already_upgraded(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_mid_model_skipped_when_same_as_default(tmp_path: Path) -> None:
-    """Mid-model upgrade is skipped when mid_model == default_model."""
+async def test_default_model_upgrade_skipped_when_same_as_initial(tmp_path: Path) -> None:
+    """Default-model upgrade is skipped when default_model == initial_model."""
     app = _make_app(tmp_path)
-    # Override config so mid_model equals default_model
-    app.config.whisper.mid_model = "tiny"
+    # Override config so default_model equals initial_model
+    app.config.whisper.default_model = "tiny"
 
     _add_memo(app.engine, tmp_path, "hash1", "2026-0001", text="Done")
     with Session(app.engine) as session:

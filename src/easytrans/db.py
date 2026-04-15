@@ -85,12 +85,12 @@ def get_untranscribed_memos(session: Session) -> list[Memo]:
 
 
 def get_memos_needing_upgrade(
-    session: Session, mid_model: str, large_model: str,
+    session: Session, default_model: str, large_model: str,
 ) -> list[Memo]:
-    """Get memos that have a transcription but none with mid_model or large_model.
+    """Get memos that have a transcription but none with default_model or large_model.
 
     Returns memos where tier 1 is done (at least one transcription exists)
-    but no transcription uses mid_model or large_model yet, ordered by file_id.
+    but no transcription uses default_model or large_model yet, ordered by file_id.
     """
     has_transcription = exists(
         select(Transcription.id).where(
@@ -100,7 +100,7 @@ def get_memos_needing_upgrade(
     has_upgrade = exists(
         select(Transcription.id).where(
             Transcription.memo_hash == Memo.file_hash,
-            Transcription.model_name.in_([mid_model, large_model]),
+            Transcription.model_name.in_([default_model, large_model]),
         )
     )
     stmt = (

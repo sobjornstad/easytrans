@@ -24,9 +24,9 @@ audio_dir = "RECORDER/FOLDER_B"
 
 [whisper]
 # Model for initial fast transcription
-default_model = "tiny"
-# Model for automatic mid-quality upgrade
-mid_model = "small"
+initial_model = "tiny"
+# If set, auto-upgrade all items to this model once initial fast transcriptions are done
+default_model = "small"
 # Model for re-transcription with higher quality
 large_model = "medium"
 # Maximum CPU threads per Whisper inference process.
@@ -47,8 +47,8 @@ class RecorderConfig:
 
 @dataclass
 class WhisperConfig:
-    default_model: str = "tiny"
-    mid_model: str = "small"
+    initial_model: str = "tiny"
+    default_model: str = "small"
     large_model: str = "medium"
     cpu_threads: int = 4
 
@@ -104,8 +104,8 @@ def load_config(config_path: Path | None = None) -> EasyTransConfig:
             audio_dir=recorder.get("audio_dir", "RECORDER/FOLDER_B"),
         ),
         whisper=WhisperConfig(
-            default_model=whisper.get("default_model", "tiny"),
-            mid_model=whisper.get("mid_model", "small"),
+            initial_model=whisper.get("initial_model", "tiny"),
+            default_model=whisper.get("default_model", "small"),
             large_model=whisper.get("large_model", "medium"),
             cpu_threads=whisper.get("cpu_threads", 4),
         ),

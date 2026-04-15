@@ -209,7 +209,7 @@ def _add_transcription(
     db_session.flush()
 
 
-def test_upgrade_returns_memos_with_only_default_model(db_session: Session) -> None:
+def test_upgrade_returns_memos_with_only_initial_model(db_session: Session) -> None:
     """Memos with only a 'tiny' transcription need upgrading."""
     m1 = _make_memo("hash1", "2026-0001")
     m2 = _make_memo("hash2", "2026-0002")
@@ -222,8 +222,8 @@ def test_upgrade_returns_memos_with_only_default_model(db_session: Session) -> N
     assert [m.file_hash for m in result] == ["hash1", "hash2"]
 
 
-def test_upgrade_excludes_memos_with_mid_model(db_session: Session) -> None:
-    """Memos already having a mid_model transcription are excluded."""
+def test_upgrade_excludes_memos_with_default_model(db_session: Session) -> None:
+    """Memos already having a default_model transcription are excluded."""
     m1 = _make_memo("hash1", "2026-0001")
     db_session.add(m1)
     db_session.flush()
