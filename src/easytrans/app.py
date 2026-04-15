@@ -100,14 +100,6 @@ class MemoPreview(VerticalScroll):
         amount = max(1, self.scrollable_content_region.height // 2)
         self.scroll_relative(y=-amount, animate=False)
 
-    def on_key(self, event: Key) -> None:
-        # Any non-playback-control key while playing stops playback,
-        # then continues with normal handling.
-        app = self.app
-        if getattr(app, "_player", None) is not None:
-            if event.key not in _PLAYBACK_CONTROL_KEYS:
-                app._stop_playback()
-
 
 class PlaybackStatus(Static):
     """Status bar shown while audio is playing."""
@@ -124,18 +116,6 @@ class PlaybackStatus(Static):
         display: block;
     }
     """
-
-
-# Keys that should NOT stop playback when pressed during playback.
-# `p` toggles stop via the binding; <,>,up,down are handled by app
-# priority bindings that fire only while playing.
-_PLAYBACK_CONTROL_KEYS = frozenset({
-    "p",
-    "less_than_sign",
-    "greater_than_sign",
-    "up",
-    "down",
-})
 
 
 class GotoStatus(Static):
@@ -410,13 +390,6 @@ class MemoTable(DataTable):
     # --- Key handling ---
 
     def on_key(self, event: Key) -> None:
-        # Any non-playback-control key while playing stops playback,
-        # then continues with normal handling so the key still navigates.
-        app = self.app
-        if getattr(app, "_player", None) is not None:
-            if event.key not in _PLAYBACK_CONTROL_KEYS:
-                app._stop_playback()
-
         # gg handling — must come first
         if event.character == "g":
             if self._g_pending:
@@ -739,11 +712,11 @@ class EasyTransApp(App):
         Binding("less_than_sign", "seek_back", "<5s", id="seek_back"),
         Binding("greater_than_sign", "seek_forward", ">5s", id="seek_forward"),
         Binding(
-            "up", "playback_prev_line", "Prev Line",
+            "up,k", "playback_prev_line", "Prev Line",
             id="playback_prev", priority=True, show=False,
         ),
         Binding(
-            "down", "playback_next_line", "Next Line",
+            "down,j", "playback_next_line", "Next Line",
             id="playback_next", priority=True, show=False,
         ),
         Binding("t", "toggle_timestamps", "Timestamps"),
@@ -810,6 +783,8 @@ class EasyTransApp(App):
         if action in ("playback_prev_line", "playback_next_line"):
             return True if playing else False
         if action == "record":
+            return False if playing else True
+        if action == "toggle_timestamps":
             return False if playing else True
         return True
 
@@ -1262,6 +1237,7 @@ class EasyTransApp(App):
 
         self.refresh_bindings()
         self._render_preview_with_highlight()
+        self.query_one("#preview", MemoPreview).focus()
 
     def _stop_playback(self) -> None:
         if self._player is None:
@@ -1295,6 +1271,7 @@ class EasyTransApp(App):
 
         self.refresh_bindings()
         self._refresh_preview_content()
+        self.query_one("#memo-table", MemoTable).focus()
 
     def _on_playback_tick(self) -> None:
         if self._player is None:
@@ -1346,6 +1323,22 @@ class EasyTransApp(App):
 
         preview = self.query_one("#preview", MemoPreview)
         preview.update(text)
+        self._scroll_preview_to_current_segment()
+
+    def _scroll_preview_to_current_segment(self) -> None:
+        if not self._playback_segments:
+            return
+        try:
+            preview = self.query_one("#preview", MemoPreview)
+        except Exception:
+            return
+        y = self._playback_segment_idx
+        top = preview.scroll_offset.y
+        height = preview.scrollable_content_region.height
+        if height <= 0:
+            return
+        if y < top or y >= top + height:
+            preview.scroll_to(y=max(0, y - height // 3), animate=False)
 
     def action_toggle_timestamps(self) -> None:
         """Toggle timestamp display in preview pane."""

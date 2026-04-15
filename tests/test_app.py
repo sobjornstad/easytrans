@@ -1714,47 +1714,153 @@ async def test_up_during_playback_goes_back_a_segment(tmp_path: Path) -> None:
         assert players[0].absolute_seeks[-1] == 5.0
 
 
+def _many_segments_text(n: int = 30) -> str:
+    return "\n".join(f"[{i // 60:02d}:{i % 60:02d}] Line number {i}" for i in range(n))
+
+
 @pytest.mark.asyncio
-async def test_j_during_playback_stops_and_navigates(tmp_path: Path) -> None:
+async def test_j_during_playback_advances_segment(tmp_path: Path) -> None:
+    """j advances to the next segment during playback, like down arrow."""
     app = _make_app(tmp_path)
-    _add_memo_with_audio_and_segments(app, tmp_path, file_hash="phash1", file_id="2026-0010")
-    _add_memo_with_audio_and_segments(app, tmp_path, file_hash="phash2", file_id="2026-0011")
+    _add_memo_with_audio_and_segments(app, tmp_path)
     players = _install_stub_player(app)
 
     async with app.run_test() as pilot:
-        assert app._get_selected_row_key() == "phash1"
+        await pilot.press("p")
+        await pilot.pause()
+        assert app._playback_segment_idx == 0
+
+        await pilot.press("j")
+        await pilot.pause()
+        assert app._is_playing is True
+        assert app._playback_segment_idx == 1
+        assert players[0].absolute_seeks == [5.0]
+
+        await pilot.press("j")
+        await pilot.pause()
+        assert app._playback_segment_idx == 2
+        assert players[0].absolute_seeks == [5.0, 10.0]
+
+
+@pytest.mark.asyncio
+async def test_ctrl_e_during_playback_does_not_stop_playback(tmp_path: Path) -> None:
+    """Regression: ctrl+e used to stop playback via the MemoTable on_key hook."""
+    app = _make_app(tmp_path)
+    _add_memo_with_audio_and_segments(app, tmp_path)
+    _install_stub_player(app)
+
+    async with app.run_test() as pilot:
         await pilot.press("p")
         await pilot.pause()
         assert app._is_playing is True
 
-        await pilot.press("j")
+        await pilot.press("ctrl+e")
         await pilot.pause()
-        assert app._is_playing is False
-        assert players[0].stop_called is True
-        assert app._get_selected_row_key() == "phash2"
+        await pilot.press("ctrl+y")
+        await pilot.pause()
+
+        assert app._is_playing is True
 
 
 @pytest.mark.asyncio
-async def test_k_during_playback_stops_and_navigates(tmp_path: Path) -> None:
+async def test_down_during_playback_scrolls_preview_to_follow_segment(
+    tmp_path: Path,
+) -> None:
+    """Regression: advancing segments past the visible region must scroll the
+    preview so the current segment stays on screen."""
     app = _make_app(tmp_path)
-    _add_memo_with_audio_and_segments(app, tmp_path, file_hash="phash1", file_id="2026-0010")
-    _add_memo_with_audio_and_segments(app, tmp_path, file_hash="phash2", file_id="2026-0011")
-    players = _install_stub_player(app)
+    _add_memo_with_audio_and_segments(
+        app, tmp_path,
+        segments_text=_many_segments_text(30),
+    )
+    _install_stub_player(app)
+
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.press("p")
+        await pilot.pause()
+
+        preview = app.query_one("#preview", MemoPreview)
+        height = preview.scrollable_content_region.height
+        assert height > 0
+
+        # Advance past the bottom of the initial viewport.
+        for _ in range(height + 3):
+            await pilot.press("down")
+            await pilot.pause()
+
+        top = preview.scroll_offset.y
+        idx = app._playback_segment_idx
+        assert top > 0
+        assert top <= idx < top + height
+
+
+@pytest.mark.asyncio
+async def test_timestamps_action_hidden_during_playback(tmp_path: Path) -> None:
+    """Regression: the Timestamps action is suppressed while playing because
+    timestamps are forced on in play mode."""
+    app = _make_app(tmp_path)
+    _add_memo_with_audio_and_segments(app, tmp_path)
+    _install_stub_player(app)
 
     async with app.run_test() as pilot:
-        await pilot.press("j")
-        await pilot.pause()
-        assert app._get_selected_row_key() == "phash2"
+        assert app.check_action("toggle_timestamps", ()) is True
 
         await pilot.press("p")
         await pilot.pause()
         assert app._is_playing is True
+        assert app.show_timestamps is True
+        assert app.check_action("toggle_timestamps", ()) is False
+
+        await pilot.press("t")
+        await pilot.pause()
+        # Timestamps stays on, because the action was blocked.
+        assert app.show_timestamps is True
+        assert app._is_playing is True
+
+
+@pytest.mark.asyncio
+async def test_preview_is_focused_during_playback(tmp_path: Path) -> None:
+    """Entering play mode focuses the preview pane; exiting returns focus to
+    the memo table."""
+    app = _make_app(tmp_path)
+    _add_memo_with_audio_and_segments(app, tmp_path)
+    _install_stub_player(app)
+
+    async with app.run_test() as pilot:
+        table = app.query_one("#memo-table", MemoTable)
+        preview = app.query_one("#preview", MemoPreview)
+        assert app.focused is table
+
+        await pilot.press("p")
+        await pilot.pause()
+        assert app.focused is preview
+
+        await pilot.press("p")
+        await pilot.pause()
+        assert app.focused is table
+
+
+@pytest.mark.asyncio
+async def test_k_during_playback_goes_back_a_segment(tmp_path: Path) -> None:
+    """k goes back a segment during playback, like up arrow."""
+    app = _make_app(tmp_path)
+    _add_memo_with_audio_and_segments(app, tmp_path)
+    players = _install_stub_player(app)
+
+    async with app.run_test() as pilot:
+        await pilot.press("p")
+        await pilot.pause()
+        await pilot.press("j")
+        await pilot.pause()
+        await pilot.press("j")
+        await pilot.pause()
+        assert app._playback_segment_idx == 2
 
         await pilot.press("k")
         await pilot.pause()
-        assert app._is_playing is False
-        assert players[0].stop_called is True
-        assert app._get_selected_row_key() == "phash1"
+        assert app._is_playing is True
+        assert app._playback_segment_idx == 1
+        assert players[0].absolute_seeks[-1] == 5.0
 
 
 @pytest.mark.asyncio

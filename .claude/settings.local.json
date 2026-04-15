@@ -31,7 +31,11 @@
       "Bash(jj diff *)",
       "Read(//home/soren/easytrans-data/audio/**)",
       "Read(//home/soren/easytrans-data/**)",
-      "Bash(/home/soren/.claude/skills/tmux-tui/scripts/tui.sh send-keys *)"
+      "Bash(/home/soren/.claude/skills/tmux-tui/scripts/tui.sh send-keys *)",
+      "Read(//home/soren/.local/share/**)",
+      "Read(//home/soren/.local/cl/easytrans/**)",
+      "Bash(ls *.md *.txt)",
+      "Bash(jj status *)"
     ]
   }
 }
