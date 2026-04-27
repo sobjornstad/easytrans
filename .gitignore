@@ -1,2 +1,8 @@
 .vagrant/
 __pycache__/
+.venv/
+.pytest_cache/
+.jj/
+*.egg-info/
+dist/
+build/

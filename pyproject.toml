@@ -39,5 +39,3 @@ asyncio_mode = "auto"
 [tool.pyright]
 pythonVersion = "3.12"
 typeCheckingMode = "basic"
-venvPath = "/home/vagrant/.venvs"
-venv = "easytrans"

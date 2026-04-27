@@ -37,7 +37,9 @@
       "Bash(ls *.md *.txt)",
       "Bash(jj status *)",
       "Bash(/home/soren/.claude/skills/tmux-tui/scripts/tui.sh restart *)",
-      "Bash(/home/soren/.claude/skills/tmux-tui/scripts/tui.sh resize *)"
+      "Bash(/home/soren/.claude/skills/tmux-tui/scripts/tui.sh resize *)",
+      "Bash(git check-ignore *)",
+      "Read(//home/soren/dotfiles/claude-skills/tmux-tui/**)"
     ]
   }
 }
