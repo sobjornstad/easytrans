@@ -8,9 +8,25 @@ transcript.
 
 [faster-whisper]: https://github.com/SYSTRAN/faster-whisper
 
-This is a vibecoded personal-workflow tool; it's published in case the design
-is useful to others. See [`spec/SPEC.md`](spec/SPEC.md) for the full product/UX
-intent.
+
+## AI use
+
+This is a **vibecoded personal-workflow tool**,
+written almost 100% by Claude Code.
+I have barely looked at the code at all
+(I could not tell you anything about the high-level architecture
+except some of the libraries that are used).
+
+easytrans works great for me,
+but is primarily published in case the design is useful to others.
+If your workflow is different than mine,
+you may be better off vibecoding your own tool than trying to use this one;
+it wasn’t hard!
+
+See [`spec/SPEC.md`](spec/SPEC.md) for the full product/UX intent.
+
+This README was also written by AI.
+
 
 ## Install and run
 
